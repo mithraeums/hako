@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mini-local"
+version = "0.0.1"
+description = "miniLocal: train → distill → quantize for iSH"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+train = ["torch>=2.2", "numpy"]
+data  = ["datasets", "tokenizers", "numpy"]
+
+[tool.ruff]
+line-length = 100
+indent-width = 1        # tabs
+target-version = "py310"
+
+[tool.ruff.format]
+indent-style = "tab"
