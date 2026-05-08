@@ -1,4 +1,6 @@
-# miniLocal
+# koi 
+
+Our first public model; an open source ~300M param model quantinzed to run on <500MB via something as constrained as iSH.
 
 Train a transformer from scratch. Distill and quantize it down to something that runs on **iSH** — x86 user-mode Linux on an iPhone — at ≥2 tok/s from mmap'd weights, in under 500MB RAM.
 
