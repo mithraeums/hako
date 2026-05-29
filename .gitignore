@@ -6,22 +6,26 @@ dist/
 .venv/
 .ruff_cache/
 
-# Checkpoints & weights
-nano/checkpoints/
+# Experimental (from-scratch research, not shipping)
+experimental/
+
+# Fine-tune artifacts (koi)
+koi/sft/.cache/
+koi/sft/dataset.jsonl
+koi/sft/out-*/
+koi/models/**/*.gguf
+koi/models/**/*.safetensors
+koi/models/**/*.bin
+*.gguf
 *.pt
 *.mlf
-models/*.mlf
-
-# C build
-engine/build/
-engine/_build*/
 *.o
 *.a
 
 # macOS
 .DS_Store
 
-# editors
+# Editors
 .idea/
 .vscode/
 *.swp
