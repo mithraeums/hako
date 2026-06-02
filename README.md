@@ -50,7 +50,9 @@
   </tr>
 </table>
 
-> **hakm CLI captures pending.** `hakm run`, `hakm list`, `hakm pull` shots will replace the reused suite images above as they're recorded. The agent + editor stand-ins demonstrate the live stock-wraps (`hako-sho-stock`, `hako-koi-mini-stock`) working end-to-end today.
+> **Engine captures pending.** `hakm` run/chat shots will replace the reused
+> suite images above as they're recorded. The stock-wraps (`hako-sho-stock` 3B,
+> `hako-koi-mini-stock` 7B) run on the native engine end-to-end today.
 
 <br>
 
@@ -92,7 +94,7 @@
 - **Local first.** Models run on your device. Offline. No cloud inference. No API calls at runtime.
 - **Four tiers.** **mini** (sho, 3B, phone-reachable), **mid-small** (koi-mini, 7B, M-class iPad and laptop), **mid** (koi, 14B/32B target, desktop), **max** (50B+ reserved). Quantization is the brand promise: older hardware stays useful.
 - **Honest framing.** Stock-wrap is labeled stock-wrap. Fine-tune is labeled fine-tune. Every Modelfile SYSTEM and model card says exactly what it is.
-- **One CLI: `hakm`.** Standalone runner. `hakm run sho "..."`, `hakm chat koi-mini`, `hakm list`, `hakm pull sho`. Shell stub today, native runner in v0.1.7.
+- **Native engine, zero deps.** `hako/engine/` is a from-scratch C inference runtime — own GGUF→MLF2 loader, own Q4_K/Q6_K dequant + matmul kernels (int8 fast path, AVX2), own BPE tokenizer. **No llama.cpp, no ggml, no torch, no ollama at runtime.** Runs the real Qwen2.5-Coder weights end to end. Links into `hako` (the agent) as `libhakm.a` and runs **in-process** — no subprocess, no server, no port.
 - **Wired into the suite.** `hako` (the agent) auto-defaults to whichever `hako-*-v*` is installed (preference: koi > koi-mini > sho). `hake` (the editor) embeds the agent in a split pane. Zero config when all three are present.
 - **Tool-use ready.** Each Modelfile SYSTEM teaches the `<tool name="...">{...}</tool>` schema the agent parses. Works on a 3B model, not just chat.
 - **ChatML throughout.** `<|im_start|>` / `<|im_end|>` template. No vendor lock.
@@ -102,48 +104,50 @@
 
 ## Install
 
-### One-line install (recommended)
+### Build the engine
 
 ```sh
-curl -fsSL https://mithraeums.github.io/hakm.sh | sh
+git clone https://github.com/mithraeums/hako.git && cd hako/engine
+make                        # builds ./hakm — libc + libm + pthread only, no deps
 ```
 
-Installs `hakm` + pulls the live stock-wraps: `hako-sho-stock` (3B) and `hako-koi-mini-stock` (7B). Run `hakm run sho "hello"` immediately after.
+### Get weights (one-time, offline)
 
-> **v0.1.6 note:** transport is ollama today (transitional). The native `hakm-server` lands v0.1.7 and drops every external runtime dep.
-
-### Manual
+The runtime loads `.mlf2` files — our native container. Convert any Qwen2.5-Coder
+GGUF (from HuggingFace, or an existing ollama blob) with the pure-stdlib converter:
 
 ```sh
-# 1. clone
-git clone https://github.com/mithraeums/hako.git && cd hako
-
-# 2. install hakm into ~/.local/bin (or anywhere on PATH)
-install -m 0755 hakm ~/.local/bin/hakm
-
-# 3. build a stock-wrap (base + bundled Modelfile)
-hakm pull sho               # or: hakm pull koi-mini
+python3 tools/gguf2mlf.py qwen2.5-coder-3b-instruct-q4_k_m.gguf hako-sho-stock.mlf2
+mkdir -p ~/.hako/models && mv hako-sho-stock.mlf2 ~/.hako/models/
 ```
 
-### Verify
+No ollama needed — the GGUF is just a byte source for the one-time conversion.
+
+### Run
 
 ```sh
-hakm --version              # hakm 0.1.0
-hakm list                   # NAME                  ID   SIZE   MODIFIED
-                            # hako-sho-stock        ...
-hakm run sho "write fib"    # streams response
+./hakm ~/.hako/models/hako-sho-stock.mlf2 -n 5 "The capital of France is"
+# hakm: hako engine · arch qwen2 · 3.09B params · 36 layers · ...
+# Paris
+
+./hakm ~/.hako/models/hako-sho-stock.mlf2 --sys "You are hako."   # chat REPL
 ```
+
+Drop a `.mlf2` in `~/.hako/models/` and the `hako` agent picks it up automatically
+(provider `mithraeum`, in-process).
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
 
 ## Tiers
 
-| Tier | Project | Base | Today | Target | Runtime | Hardware |
-|---|---|---|---|---|---|---|
-| **mini** | [sho](sho/) | Qwen2.5-Coder-3B-Instruct | stock-wrap | 3B fine-tune on mithraeum docs | ollama (hakm-server v0.1.7) | iPhone, iPad, iSh, anything CPU |
-| **mid-small** | [koi-mini](koi/) | Qwen2.5-Coder-7B-Instruct | stock-wrap | 7B fine-tune | ollama (hakm-server v0.1.7) | M-class iPad, any laptop |
-| **mid** | [koi](koi/) | Qwen2.5-Coder-14B (or 24B) | not pulled | 32B fine-tune on rented A100 | ollama, then hakm-server | desktop, workstation |
-| **max** | samurai | TBD | not pulled | 50B (later 128B, 200B) | hakm-server | workstation, dGPU |
+All tiers run on the **native hako engine** (`engine/`) — no ollama, no llama.cpp.
+
+| Tier | Project | Base | Today | Target | Hardware |
+|---|---|---|---|---|---|
+| **mini** | [sho](sho/) | Qwen2.5-Coder-3B-Instruct | stock-wrap, runs on the engine | 3B fine-tune on mithraeum docs | iPhone, iPad, iSh, anything CPU |
+| **mid-small** | [koi-mini](koi/) | Qwen2.5-Coder-7B-Instruct | stock-wrap (same arch, converts unchanged) | 7B fine-tune | M-class iPad, any laptop |
+| **mid** | [koi](koi/) | Qwen2.5-Coder-14B (or 24B) | not pulled | 32B fine-tune on rented A100 | desktop, workstation |
+| **max** | samurai | TBD | not pulled | 50B (later 128B, 200B) | workstation, dGPU |
 
 ### Model catalog
 
@@ -162,17 +166,18 @@ Scratch-from-scratch research (byte-level GPT, own C17 inference, `.mlf` format)
 
 ## Use
 
-### Standalone via `hakm`
+### Standalone via the engine
 
 ```sh
-hakm run sho "explain ring buffers in C"
-hakm chat koi-mini               # interactive REPL
-hakm list                        # installed hako-* models
-hakm pull sho                    # download base + create hako-sho-stock
-hakm models                      # full catalog
+cd engine && make
+./hakm ~/.hako/models/hako-sho-stock.mlf2 "explain ring buffers in C"   # one-shot
+./hakm ~/.hako/models/hako-sho-stock.mlf2 --sys "You are hako."         # chat REPL
+# flags: -n new-tokens  -t temp(0=greedy)  -p top_p  -k top_k  --raw  --info
 ```
 
-`hakm <short>` resolves shorthand to the current tag (`sho` → `hako-sho-stock`, `koi-mini` → `hako-koi-mini-stock`, `koi` → `hako-koi-v0.0.1` when shipped).
+Convert weights once with `tools/gguf2mlf.py` (see Install). The `.mlf2` is our
+native container — k-quant blocks copied verbatim, tokenizer embedded, ~1.9 GB
+for the 3B.
 
 ### Via [hako-code](https://github.com/mithraeums/hako-code) (the agent)
 
@@ -204,20 +209,15 @@ Open `hake`, drop into the AI pane (`Ctrl-W r`), set `:provider mithraeum` `:mod
 
 ```
 hako/                          (this repo, mithraeums/hako)
-├─ hakm                        standalone CLI runner (shell stub today, C in v0.2)
-├─ koi/                        mid + mid-small tiers, Qwen-based, mithraeum runtime
-│   ├─ sft/                    LoRA fine-tune pipeline (axolotl)
-│   ├─ models/                 Modelfiles + (gitignored) GGUF weights
-│   │   └─ hako-koi-mini-stock/   7B stock-wrap, tool-aware SYSTEM
-│   └─ data/                   fine-tune datasets (gitignored)
-├─ sho/                        mini tier, 3B stock-wrap today
-│   └─ models/
-│       └─ hako-sho-stock/        3B stock-wrap, tool-aware SYSTEM
+├─ engine/                     native C inference runtime — the deliverable
+│   ├─ src/                    loader, quant (Q4_K/Q6_K + int8 dot), nn, model, bpe, sample
+│   ├─ hakm_api.{h,c}          in-process embed API → libhakm.a (linked by hako-code)
+│   ├─ cli/main.c              hakm CLI (one-shot / chat REPL)
+│   ├─ tools/gguf2mlf.py       pure-stdlib GGUF → MLF2 converter
+│   └─ Makefile                make hakm | make lib | make test_api
+├─ koi/                        mid + mid-small fine-tune recipes (axolotl/QLoRA)
+├─ sho/                        mini tier notes
 └─ experimental/               from-scratch research, gitignored, not shipping
-    ├─ nano/                   byte-level GPT trainer (Python + torch)
-    ├─ engine/                 C17 inference, libc + libm, mmap'd .mlf
-    ├─ models/                 .mlf weight files
-    └─ data/                   pretrain corpora
 ```
 
 <p align="center"><sub><b>—— VI ——</b></sub></p>
@@ -228,7 +228,11 @@ hako/                          (this repo, mithraeums/hako)
 - **Tool-call format** compatible with [hako-code](https://github.com/mithraeums/hako-code)'s `HK_TOOLS` schema (prose `<tool name="X">{...}</tool>` parsed at the agent boundary)
 - **Local-only inference.** No cloud at runtime.
 - **Honest framing** in every Modelfile SYSTEM and model card. Stock is stock. Fine-tunes name their base and corpus.
-- **C-first runtime.** Ollama is the transport today. `hakm-server` (v0.1.7) replaces it: minimal llama.cpp subset, CPU-only, drops the runtime dep. v0.2 swaps the vendored kernels for hand-tuned RoPE / RMSNorm / SwiGLU / attention / Q4_K dequant in AVX2 + NEON.
+- **C-first runtime, zero deps.** The `engine/` runs the models with nothing but
+  libc + libm + pthread — own loader, own Q4_K/Q6_K dequant + matmul (int8 fast
+  path, AVX2 today, NEON for arm64), own BPE. No llama.cpp, no ggml, no torch, no
+  ollama. Honest on speed: it's correctness-first (~2-3 tok/s on a 3B, 4-core
+  Intel) — the point is owning the whole stack, not beating tuned GPU runtimes.
 
 <p align="center"><sub><b>—— VII ——</b></sub></p>
 
@@ -236,7 +240,7 @@ hako/                          (this repo, mithraeums/hako)
 
 | Product | CLI | Source | Role |
 |---|---|---|---|
-| Models (this) | `hakm <model> <prompt>` | [mithraeums/hako](https://github.com/mithraeums/hako) | local weights + runner |
+| Models (this) | `hakm <model.mlf2> <prompt>` | [mithraeums/hako](https://github.com/mithraeums/hako) | native C engine + weights |
 | Agent | `hako` | [mithraeums/hako-code](https://github.com/mithraeums/hako-code) | terminal AI agent |
 | Editor | `hake` | [mithraeums/hako-edit](https://github.com/mithraeums/hako-edit) | modal terminal editor (embeds the agent) |
 
@@ -248,9 +252,12 @@ hako/                          (this repo, mithraeums/hako)
 - **`hako-koi-mini-v0.0.1`** same recipe at 7B.
 - **`hako-koi-v0.0.1`** mid-tier debut: 14B/32B base, LoRA on rented A100. Tooling staged in `koi/sft/`.
 - **`hako-samurai-v0.0.1`** max tier, 50B+, reserved on hardware.
-- **Native engine (v0.1.7)** `hakm-server`: vendored minimal llama.cpp subset for Qwen2 Q4_K_M, CPU-only. Drops ollama runtime dep.
-- **Own kernels (v0.2)** RoPE / RMSNorm / SwiGLU / attention / Q4_K dequant, hand-tuned AVX2 + NEON. Drops every line of vendored code.
-- **mithraeum-native provider in hako-code** today `:provider mithraeum` aliases to ollama transport; v0.1.7 swaps to `hakm-server` over a local port.
+- **✅ Native engine — SHIPPED.** Own loader, dequant, kernels, tokenizer in C.
+  No llama.cpp ever — we skipped the "vendor it first" step and built the whole
+  stack. Runs in-process in hako-code via `libhakm.a`. Zero ollama.
+- **✅ Own kernels — SHIPPED.** Q4_K/Q6_K dequant + int8-activation × int4-weight
+  matmul, AVX2. Next: NEON (arm64), tighter SIMD, speculative decode (sho as a
+  draft model) to push past the single-machine compute ceiling.
 - **samurai (max)** waits on hardware (target: RTX 5090 + 128GB DDR5).
 - **Scale plan** 2x-4x each tier when training budget allows. Eventual lineup roughly 6B sho, 14B-24B koi-mini, 64B-128B koi, 200B max.
 

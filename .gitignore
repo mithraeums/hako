@@ -23,7 +23,7 @@ koi/models/**/*.bin
 *.a
 
 # macOS
-.DS_Store
+*.DS_Store
 
 # Editors
 .idea/
