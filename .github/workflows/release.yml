@@ -1,0 +1,142 @@
+name: release
+
+# Builds + ships the standalone `hakm` engine binary. The hako-code agent finds
+# it on PATH / in ~/.hako/bin and spawns it per turn (`hakm <model.mlf2>
+# --chat-stdin`); users can also run it directly. Weights are NOT here — they're
+# pulled from huggingface.co/mithraeum/<id>.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+# ── ARCH portability ──
+# The engine's AVX2 dot path is COMPILE-gated by -march (#elif __AVX2__), so the
+# shipped baseline trades the ~10% AVX2 win for running on any CPU. The bigger
+# ~2.1x int8 win is plain integer math (-O3 auto-vectorizes within the target),
+# kept at every baseline. To require Haswell+ (2013) and get AVX2, bump the linux
+# baseline to `-march=x86-64-v3`. -march=native is NEVER used in CI (would SIGILL
+# on older user CPUs). Users building locally still get -march=native by default.
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            arch: "-march=x86-64-v2"
+            artifact: hakm-linux-x86_64.tar.gz
+            staging: hakm-linux-x86_64
+            sha: hakm-linux-x86_64.sha256
+
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            arch: "-march=armv8-a"
+            artifact: hakm-linux-arm64.tar.gz
+            staging: hakm-linux-arm64
+            sha: hakm-linux-arm64.sha256
+
+          - name: macos-universal
+            os: macos-latest
+            arch: "-arch arm64 -arch x86_64"
+            artifact: hakm-macos-universal.tar.gz
+            staging: hakm-macos-universal
+            sha: hakm-macos-universal.sha256
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build hakm
+        run: |
+          make ARCH="${{ matrix.arch }}"
+          ./hakm --version 2>/dev/null || ./hakm 2>/dev/null | head -1 || true
+          file hakm
+          mkdir -p ${{ matrix.staging }}
+          cp hakm README.md LICENSE ${{ matrix.staging }}/
+          tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
+          if command -v sha256sum >/dev/null; then
+            (cd ${{ matrix.staging }} && sha256sum hakm > ../${{ matrix.sha }})
+          else
+            (cd ${{ matrix.staging }} && shasum -a 256 hakm > ../${{ matrix.sha }})
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.sha }}
+          if-no-files-found: error
+
+  # Windows has no engine build: the loader uses POSIX mmap (sys/mman.h), which
+  # MinGW lacks. Needs an #ifdef _WIN32 mmap shim before it can ship here.
+  build-freebsd:
+    name: build (freebsd-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.1"
+          usesh: true
+          prepare: |
+            pkg install -y gmake gcc
+          run: |
+            gmake CC=gcc ARCH="-march=x86-64-v2"
+            file hakm
+            mkdir -p hakm-freebsd-x86_64
+            cp hakm README.md LICENSE hakm-freebsd-x86_64/
+            tar czf hakm-freebsd-x86_64.tar.gz hakm-freebsd-x86_64
+            (cd hakm-freebsd-x86_64 && printf '%s  hakm\n' "$(sha256 -q hakm)" > ../hakm-freebsd-x86_64.sha256)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-x86_64
+          path: |
+            hakm-freebsd-x86_64.tar.gz
+            hakm-freebsd-x86_64.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [build, build-freebsd]
+    runs-on: ubuntu-latest
+    if: always() && needs.build.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: hako engine ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/**/hakm-linux-x86_64.tar.gz
+            dist/**/hakm-linux-arm64.tar.gz
+            dist/**/hakm-macos-universal.tar.gz
+            dist/**/hakm-freebsd-x86_64.tar.gz
+            dist/**/*.sha256

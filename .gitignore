@@ -1,3 +1,28 @@
+# ── hako engine repo: engine source only ──
+
+# Engine build artifacts
+hakm
+test_quant
+test_api
+*.o
+*.a
+
+# Model weights — never in the repo (pulled from HuggingFace at runtime)
+*.mlf2
+*.gguf
+*.mlf
+*.bin
+*.pt
+*.safetensors
+
+# Model production: recipes + scratch kept LOCAL, not published here.
+# (sho/ koi/ fine-tune recipes move to their own repo when training starts;
+#  experimental/ is from-scratch research.)
+sho/
+koi/
+experimental/
+data/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -5,22 +30,6 @@ __pycache__/
 dist/
 .venv/
 .ruff_cache/
-
-# Experimental (from-scratch research, not shipping)
-experimental/
-
-# Fine-tune artifacts (koi)
-koi/sft/.cache/
-koi/sft/dataset.jsonl
-koi/sft/out-*/
-koi/models/**/*.gguf
-koi/models/**/*.safetensors
-koi/models/**/*.bin
-*.gguf
-*.pt
-*.mlf
-*.o
-*.a
 
 # macOS
 *.DS_Store
