@@ -44,3 +44,8 @@ void quantize_row_q8_32(const float *x, int n, int8_t *xq, float *xs);
  * pre-quantized activation (xq/xs from quantize_row_q8_32). Weights stay exact;
  * only the activation is quantized. Returns the float dot. */
 float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs);
+
+/* Same fused dot for a Q6_K weight row. Q6_K is ~30% of a Q4_K_M model's bytes
+ * (attn_v, some ffn_down, lm_head on 7B+); without this it rides the
+ * dequant-whole-row float path — the biggest decode cost after the Q4 path. */
+float q6k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs);

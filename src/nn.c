@@ -65,38 +65,55 @@ typedef struct {
 	const float *x, *bias; float *out;
 	const int8_t *xq; const float *xs;   /* int8-quantized x for the Q4_K path */
 	int r0, r1, n_in, type; size_t rb;
+	int B, n_out;                        /* batch rows in x/out; out row stride */
 } mm_job;
 
-static void *mm_worker(void *arg) {
+static void mm_worker(void *arg) {
 	mm_job *j = (mm_job *)arg;
 	const unsigned char *base = (const unsigned char *)mlf2_data(j->m, j->w);
 
 	/* Q4_K fast path: integer dot against pre-quantized activation, no per-row
-	   float dequant of the weight matrix. */
-	if (j->type == MLF2_TYPE_Q4_K) {
+	   float dequant of the weight matrix. The b-loop sits INSIDE the row loop on
+	   purpose: one weight row (~1.1 KB at d_model 2048) is read from RAM once and
+	   dotted against all B activations while hot in L1 — this is what makes
+	   batched prefill faster than B separate GEMVs. */
+	if (j->type == MLF2_TYPE_Q4_K || j->type == MLF2_TYPE_Q6_K) {
+		int xsn = j->n_in / 32;
+		int q6 = (j->type == MLF2_TYPE_Q6_K);
 		for (int r = j->r0; r < j->r1; r++) {
-			float acc = q4k_vec_dot(base + (size_t)r * j->rb, j->n_in, j->xq, j->xs);
-			j->out[r] = j->bias ? acc + j->bias[r] : acc;
+			const unsigned char *row = base + (size_t)r * j->rb;
+			for (int b = 0; b < j->B; b++) {
+				const int8_t *xqb = j->xq + (size_t)b * j->n_in;
+				const float  *xsb = j->xs + (size_t)b * xsn;
+				float acc = q6 ? q6k_vec_dot(row, j->n_in, xqb, xsb)
+				               : q4k_vec_dot(row, j->n_in, xqb, xsb);
+				float *o = j->out + (size_t)b * j->n_out;
+				o[r] = j->bias ? acc + j->bias[r] : acc;
+			}
 		}
-		return NULL;
+		return;
 	}
 
-	/* Generic path: dequant the row to float, then float dot. Heap scratch sized
-	   to n_in — must hold a full row (ffn_dim), which scales with the model
-	   (3B 11008, 7B 18944, larger tiers more); a fixed stack array overflowed. */
+	/* Generic path: dequant the row to float ONCE, then dot all B activations.
+	   Heap scratch sized to n_in — must hold a full row (ffn_dim), which scales
+	   with the model (3B 11008, 7B 18944, larger tiers more); a fixed stack
+	   array overflowed. */
 	float *scratch = malloc((size_t)j->n_in * sizeof(float));
-	if (!scratch) return NULL;
+	if (!scratch) return;
 	for (int r = j->r0; r < j->r1; r++) {
 		dequant_tensor(j->type, base + (size_t)r * j->rb, scratch, j->n_in);
-		float acc = 0.0f;
-		for (int i = 0; i < j->n_in; i++) acc += scratch[i] * j->x[i];
-		j->out[r] = j->bias ? acc + j->bias[r] : acc;
+		for (int b = 0; b < j->B; b++) {
+			const float *xb = j->x + (size_t)b * j->n_in;
+			float acc = 0.0f;
+			for (int i = 0; i < j->n_in; i++) acc += scratch[i] * xb[i];
+			float *o = j->out + (size_t)b * j->n_out;
+			o[r] = j->bias ? acc + j->bias[r] : acc;
+		}
 	}
 	free(scratch);
-	return NULL;
 }
 
-static int nthreads(void) {
+int hakm_nthreads(void) {
 	static int n = 0;
 	if (!n) {
 		const char *env = getenv("HAKM_THREADS");   /* perf knob; 0/unset = auto */
@@ -116,7 +133,9 @@ typedef struct {
 	pthread_mutex_t lock;
 	pthread_cond_t  go;      /* signalled when a new batch is ready */
 	pthread_cond_t  done;    /* signalled as each worker finishes */
-	mm_job *jobs;            /* jb[1..njobs] are the worker chunks */
+	void  (*fn)(void *);     /* job runner for this batch */
+	void   *jobs;            /* job array base; jb[1..njobs] go to workers */
+	size_t  jsize;           /* size of one job element */
 	int     njobs;           /* number of worker jobs this batch (excludes jb[0]) */
 	uint64_t gen;            /* batch generation; workers wake when it changes */
 	int     remaining;       /* worker jobs still running this batch */
@@ -127,7 +146,7 @@ typedef struct {
 
 static mm_pool POOL = { PTHREAD_MUTEX_INITIALIZER,
                         PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER,
-                        NULL, 0, 0, 0, 0, 0, {0} };
+                        NULL, NULL, 0, 0, 0, 0, 0, 0, {0} };
 
 static void *mm_pool_worker(void *arg) {
 	long id = (long)arg;          /* 1..T-1 */
@@ -141,7 +160,7 @@ static void *mm_pool_worker(void *arg) {
 		int mine = (id <= POOL.njobs);
 		pthread_mutex_unlock(&POOL.lock);
 
-		if (mine) mm_worker(&POOL.jobs[id]);   /* compute outside the lock */
+		if (mine) POOL.fn((char *)POOL.jobs + (size_t)id * POOL.jsize);   /* compute outside the lock */
 
 		pthread_mutex_lock(&POOL.lock);
 		if (mine && --POOL.remaining == 0) pthread_cond_signal(&POOL.done);
@@ -156,44 +175,50 @@ static void mm_pool_start(int T) {
 		pthread_create(&POOL.th[t], NULL, mm_pool_worker, (void *)t);
 }
 
-/* Dispatch jb[1..nw] to the pool, run jb[0] on this thread, wait for workers. */
-static void mm_pool_run(mm_job *jb, int njobs_total) {
-	if (njobs_total <= 1) { if (njobs_total == 1) mm_worker(&jb[0]); return; }
-	int nw = njobs_total - 1;     /* worker jobs (jb[1..nw]) */
+/* Generic parallel-for over a job array: jobs[1..n-1] go to pool workers, the
+ * caller runs jobs[0], then waits. Reused for matmul chunks AND attention. */
+void hakm_parallel(void (*fn)(void *), void *jobs, size_t jsize, int njobs_total) {
+	if (njobs_total <= 1) { if (njobs_total == 1) fn(jobs); return; }
+	mm_pool_start(hakm_nthreads());
+	int nw = njobs_total - 1;     /* worker jobs (jobs[1..nw]) */
 
 	pthread_mutex_lock(&POOL.lock);
-	POOL.jobs = jb;
+	POOL.fn = fn;
+	POOL.jobs = jobs;
+	POOL.jsize = jsize;
 	POOL.njobs = nw;
 	POOL.remaining = nw;
 	POOL.gen++;
 	pthread_cond_broadcast(&POOL.go);
 	pthread_mutex_unlock(&POOL.lock);
 
-	mm_worker(&jb[0]);            /* caller does chunk 0 */
+	fn(jobs);                     /* caller does chunk 0 */
 
 	pthread_mutex_lock(&POOL.lock);
 	while (POOL.remaining > 0) pthread_cond_wait(&POOL.done, &POOL.lock);
 	pthread_mutex_unlock(&POOL.lock);
 }
 
-void matmul(float *out, const float *x,
-            const hakm_model *m, const mlf2_tensor *w,
-            const float *bias, int n_out, int n_in) {
-	int T = nthreads();
+void matmul_batch(float *out, const float *x,
+                  const hakm_model *m, const mlf2_tensor *w,
+                  const float *bias, int n_out, int n_in, int B) {
+	int T = hakm_nthreads();
 	if (n_out < T) T = 1;
-	mm_pool_start(T);
 	size_t rb = row_nbytes((int)w->type, n_in);
 
-	/* For the Q4_K fast path, quantize the activation once and share it across
-	   all output rows / threads (read-only). n_in is always a multiple of 32. */
+	/* For the k-quant fast paths, quantize all B activation rows once and
+	   share them across all output rows / threads (read-only). n_in is always
+	   a multiple of 32. */
 	const int8_t *xqp = NULL; const float *xsp = NULL;
 	int8_t *xq = NULL; float *xs = NULL;
-	if ((int)w->type == MLF2_TYPE_Q4_K) {
+	if ((int)w->type == MLF2_TYPE_Q4_K || (int)w->type == MLF2_TYPE_Q6_K) {
 		/* heap-sized to n_in (multiple of 32) so it scales past the 3B; a fixed
 		   stack buffer overflowed on the 7B's ffn_dim (18944). */
-		xq = malloc((size_t)n_in);
-		xs = malloc((size_t)(n_in / 32) * sizeof(float));
-		quantize_row_q8_32(x, n_in, xq, xs);
+		xq = malloc((size_t)B * n_in);
+		xs = malloc((size_t)B * (n_in / 32) * sizeof(float));
+		for (int b = 0; b < B; b++)
+			quantize_row_q8_32(x + (size_t)b * n_in, n_in,
+			                   xq + (size_t)b * n_in, xs + (size_t)b * (n_in / 32));
 		xqp = xq; xsp = xs;
 	}
 
@@ -203,8 +228,14 @@ void matmul(float *out, const float *x,
 		int r0 = t * per, r1 = r0 + per;
 		if (r1 > n_out) r1 = n_out;
 		if (r0 >= r1) break;
-		jb[nt++] = (mm_job){ m, w, x, bias, out, xqp, xsp, r0, r1, n_in, (int)w->type, rb };
+		jb[nt++] = (mm_job){ m, w, x, bias, out, xqp, xsp, r0, r1, n_in, (int)w->type, rb, B, n_out };
 	}
-	mm_pool_run(jb, nt);
+	hakm_parallel(mm_worker, jb, sizeof(mm_job), nt);
 	free(xq); free(xs);
+}
+
+void matmul(float *out, const float *x,
+            const hakm_model *m, const mlf2_tensor *w,
+            const float *bias, int n_out, int n_in) {
+	matmul_batch(out, x, m, w, bias, n_out, n_in, 1);
 }

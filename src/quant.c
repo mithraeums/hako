@@ -17,7 +17,11 @@
 #elif defined(__AVX2__)
 #include <immintrin.h>
 #define HAKM_AVX2 1
-/* horizontal sum of 8 int32 lanes. */
+#endif
+
+#if defined(HAKM_AVX2) && !defined(__FMA__)
+/* horizontal sum of 8 int32 lanes (pre-FMA fallback path only — the FMA
+ * q4k path keeps lane sums vectorized and hsums floats once per row). */
 static inline int hsum256_epi32(__m256i v) {
 	__m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
 	                          _mm256_extracti128_si256(v, 1));
@@ -152,6 +156,9 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 	int nb = n_in / QK_K;
 	float acc = 0.0f;
 	int sb = 0;                       /* global 32-block index → xs[] */
+#if defined(HAKM_AVX2) && defined(__FMA__)
+	__m256 facc = _mm256_setzero_ps();
+#endif
 
 	for (int i = 0; i < nb; i++) {
 		const float d    = f16_to_f32(b[i].d);
@@ -163,7 +170,9 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 		int is = 0;
 		for (int g = 0; g < QK_K; g += 64) {
 			uint8_t s, m;
+#if !(defined(HAKM_AVX2) && defined(__FMA__))
 			int iqxA, ixA, iqxB, ixB;
+#endif
 
 #ifdef HAKM_NEON_DOTPROD
 			/* 64 weights (32 bytes) × 64 int8 activations via hardware sdot.
@@ -190,6 +199,44 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 			bq = vdotq_s32(bq, hiB0, xB0); bq = vdotq_s32(bq, hiB1, xB1);
 			bx = vdotq_s32(bx, ones, xB0); bx = vdotq_s32(bx, ones, xB1);
 			iqxB = vaddvq_s32(bq); ixB = vaddvq_s32(bx);
+#elif defined(HAKM_AVX2) && defined(__FMA__)
+			/* FMA path: keep the 8-lane int32 partial sums as VECTORS and fold
+			   the per-subblock scales in float lanes — ONE horizontal sum per
+			   ROW (after the loop) instead of four per 64-weight group. The
+			   hsums were the bottleneck: the first AVX2 pass measured only
+			   +10% because of them. int32→float converts are exact here
+			   (lane sums ≤ 4·15·127 = 7620 < 2^24). */
+			{
+				const __m256i qv     = _mm256_loadu_si256((const __m256i *)q);
+				const __m256i lomask = _mm256_set1_epi8(0x0F);
+				const __m256i lowA = _mm256_and_si256(qv, lomask);
+				const __m256i hiB  = _mm256_and_si256(_mm256_srli_epi16(qv, 4), lomask);
+				const __m256i xA   = _mm256_loadu_si256((const __m256i *)(xb + g));
+				const __m256i xB   = _mm256_loadu_si256((const __m256i *)(xb + g + 32));
+				const __m256i ones8  = _mm256_set1_epi8(1);
+				const __m256i ones16 = _mm256_set1_epi16(1);
+
+				const __m256i pA = _mm256_madd_epi16(_mm256_maddubs_epi16(lowA, xA), ones16);
+				const __m256i mA = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xA), ones16);
+				const __m256i pB = _mm256_madd_epi16(_mm256_maddubs_epi16(hiB,  xB), ones16);
+				const __m256i mB = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xB), ones16);
+
+				get_scale_min_k4(is + 0, sc, &s, &m);
+				facc = _mm256_fmadd_ps(_mm256_set1_ps(xs[sb] * d * s),
+				                       _mm256_cvtepi32_ps(pA), facc);
+				facc = _mm256_fnmadd_ps(_mm256_set1_ps(xs[sb] * dmin * m),
+				                        _mm256_cvtepi32_ps(mA), facc);
+				sb++;
+				get_scale_min_k4(is + 1, sc, &s, &m);
+				facc = _mm256_fmadd_ps(_mm256_set1_ps(xs[sb] * d * s),
+				                       _mm256_cvtepi32_ps(pB), facc);
+				facc = _mm256_fnmadd_ps(_mm256_set1_ps(xs[sb] * dmin * m),
+				                        _mm256_cvtepi32_ps(mB), facc);
+				sb++;
+			}
+			q  += 32;
+			is += 2;
+			continue;
 #elif defined(HAKM_AVX2)
 			/* 32 weight bytes → low nibbles = sub-block A (xb[g..g+31]),
 			   high nibbles = sub-block B (xb[g+32..g+63]). maddubs does the
@@ -219,6 +266,7 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 				iqxB += (q[l] >> 4)  * xbv; ixB += xbv;
 			}
 #endif
+#if !(defined(HAKM_AVX2) && defined(__FMA__))
 			get_scale_min_k4(is + 0, sc, &s, &m);
 			acc += xs[sb++] * (d * s * (float)iqxA - dmin * m * (float)ixA);
 			get_scale_min_k4(is + 1, sc, &s, &m);
@@ -226,8 +274,114 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 
 			q  += 32;
 			is += 2;
+#endif
 		}
 	}
+#if defined(HAKM_AVX2) && defined(__FMA__)
+	{	/* the one horizontal sum for the whole row */
+		__m128 lo = _mm_add_ps(_mm256_castps256_ps128(facc),
+		                       _mm256_extractf128_ps(facc, 1));
+		lo = _mm_hadd_ps(lo, lo);
+		lo = _mm_hadd_ps(lo, lo);
+		acc += _mm_cvtss_f32(lo);
+	}
+#endif
+	return acc;
+}
+
+/* One Q6_K row · int8 activation. Element layout mirrors dequant_q6_K: each
+ * 256-block is two 128-halves; within a half, the four 32-element groups at
+ * offsets {0,32,64,96} draw their 4-bit nibbles from {ql[0..31] low,
+ * ql[32..63] low, ql[0..31] high, ql[32..63] high} and 2 extra bits per value
+ * from qh[0..31] (bit pairs 0/2/4/6), biased -32. Weight scales are int8 per
+ * 16 elements; activation scales (xs) per 32. All MACs stay integer; ONE
+ * float fold per 32-group (and one hsum per row on the AVX2 path). */
+float q6k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs) {
+	const block_q6_K *b = (const block_q6_K *)w_row;
+	int nb = n_in / QK_K;
+	float acc = 0.0f;
+	int sb = 0;                       /* global 32-block index -> xs[] */
+#if defined(HAKM_AVX2) && defined(__FMA__)
+	__m256 facc = _mm256_setzero_ps();
+#endif
+
+	for (int i = 0; i < nb; i++) {
+		const float d = f16_to_f32(b[i].d);
+		const uint8_t *ql = b[i].ql;
+		const uint8_t *qh = b[i].qh;
+		const int8_t  *sc = b[i].scales;
+		const int8_t  *xb = xq + (size_t)i * QK_K;
+
+		for (int half = 0; half < 2; half++) {
+#if defined(HAKM_AVX2) && defined(__FMA__)
+			/* q built UNSIGNED (0..63) so maddubs applies (u8*s8 pairs,
+			   |2*63*127| < 32767); the -32 bias becomes 32*sum(x) subtracted on
+			   the int32 lanes. madd folds to 8 int32 lanes of 4 elements each:
+			   lanes 0-3 = the group's first 16 elements, so the per-16 weight
+			   scales apply with one mullo. */
+			const __m256i qlA  = _mm256_loadu_si256((const __m256i *)ql);        /* ql[0..31] */
+			const __m256i qlB  = _mm256_loadu_si256((const __m256i *)(ql + 32)); /* ql[32..63] */
+			const __m256i qh32 = _mm256_loadu_si256((const __m256i *)qh);        /* qh[0..31] */
+			const __m256i lo4   = _mm256_set1_epi8(0x0F);
+			const __m256i hi2m  = _mm256_set1_epi8(3);
+			const __m256i m0x30 = _mm256_set1_epi8(0x30);
+			const __m256i ones8  = _mm256_set1_epi8(1);
+			const __m256i ones16 = _mm256_set1_epi16(1);
+
+			for (int g = 0; g < 4; g++) {
+				const __m256i nib = (g == 0) ? _mm256_and_si256(qlA, lo4)
+				                  : (g == 1) ? _mm256_and_si256(qlB, lo4)
+				                  : (g == 2) ? _mm256_and_si256(_mm256_srli_epi16(qlA, 4), lo4)
+				                             : _mm256_and_si256(_mm256_srli_epi16(qlB, 4), lo4);
+				const __m256i hb = _mm256_and_si256(
+					_mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh32, 2 * g), hi2m), 4),
+					m0x30);
+				const __m256i qu = _mm256_or_si256(nib, hb);
+				const __m256i xv = _mm256_loadu_si256((const __m256i *)(xb + g * 32));
+
+				const __m256i ps  = _mm256_madd_epi16(_mm256_maddubs_epi16(qu, xv), ones16);
+				const __m256i sx  = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xv), ones16);
+				const __m256i sgn = _mm256_sub_epi32(ps, _mm256_slli_epi32(sx, 5));   /* -32 bias */
+				const __m256i sv  = _mm256_set_epi32(sc[2*g+1], sc[2*g+1], sc[2*g+1], sc[2*g+1],
+				                                     sc[2*g],   sc[2*g],   sc[2*g],   sc[2*g]);
+				const __m256i scaled = _mm256_mullo_epi32(sgn, sv);
+				facc = _mm256_fmadd_ps(_mm256_set1_ps(xs[sb + g] * d),
+				                       _mm256_cvtepi32_ps(scaled), facc);
+			}
+#else
+			/* scalar reference: 4 interleaved groups, per-16 int sums */
+			int32_t s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
+			for (int l = 0; l < 32; l++) {
+				const int q1 = ((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+				const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+				const int q3 = ((ql[l]      >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+				const int q4 = ((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+				if (l < 16) {
+					s0a += q1 * xb[l];      s1a += q2 * xb[l + 32];
+					s2a += q3 * xb[l + 64]; s3a += q4 * xb[l + 96];
+				} else {
+					s0b += q1 * xb[l];      s1b += q2 * xb[l + 32];
+					s2b += q3 * xb[l + 64]; s3b += q4 * xb[l + 96];
+				}
+			}
+			acc += xs[sb + 0] * d * (float)(sc[0] * s0a + sc[1] * s0b);
+			acc += xs[sb + 1] * d * (float)(sc[2] * s1a + sc[3] * s1b);
+			acc += xs[sb + 2] * d * (float)(sc[4] * s2a + sc[5] * s2b);
+			acc += xs[sb + 3] * d * (float)(sc[6] * s3a + sc[7] * s3b);
+#endif
+			sb += 4;
+			xb += 128; ql += 64; qh += 32; sc += 8;
+		}
+	}
+#if defined(HAKM_AVX2) && defined(__FMA__)
+	{
+		__m128 lo = _mm_add_ps(_mm256_castps256_ps128(facc),
+		                       _mm256_extractf128_ps(facc, 1));
+		lo = _mm_hadd_ps(lo, lo);
+		lo = _mm_hadd_ps(lo, lo);
+		acc += _mm_cvtss_f32(lo);
+	}
+#endif
 	return acc;
 }
 

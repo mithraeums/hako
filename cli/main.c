@@ -22,6 +22,14 @@
  *                  Wire for the hako agent's subprocess transport. Frame:
  *                    N\n                      (message count)
  *                    role\n len\n <len bytes>  (repeated N times)
+ *   --serve     resident: serve framed conversations from stdin in a loop,
+ *                  reusing the KV cache across requests (prefix-matched, only
+ *                  the unseen tail is prefilled). Request = chat-stdin frame
+ *                  with an optional per-request token cap: "N [n_new]\n" then
+ *                  N x ( role\n len\n <len bytes> ). Response on stdout:
+ *                    R <len>\n <len bytes>   (assistant reply)
+ *                    E <len>\n <len bytes>   (error; KV cache was reset)
+ *                  Exits on EOF / desynced frame. Stats land on stderr.
  *   --ctx N     context window in tokens (default 2048)
  */
 #include "../src/model.h"
@@ -52,18 +60,34 @@ static int push_id(int id, int *buf, int *n, int max) {
 	return 0;
 }
 
-/* Feed tokens through the model; return last logits. */
+/* Feed tokens through the model in batched chunks; return last logits.
+ * Batched prefill streams each weight row once per chunk instead of once per
+ * token (HAKM_BATCH overrides the chunk size; decode stays token-at-a-time). */
 static const float *feed(hakm_ctx *c, const int *toks, int n) {
+	static int B = 0;
+	if (!B) {
+		const char *e = getenv("HAKM_BATCH");
+		B = (e && atoi(e) > 0) ? atoi(e) : 16;
+	}
 	const float *lg = NULL;
-	for (int i = 0; i < n && c->pos < c->max_seq; i++) lg = hakm_forward(c, toks[i]);
+	for (int i = 0; i < n && c->pos < c->max_seq; ) {
+		int chunk = n - i < B ? n - i : B;
+		const float *t = hakm_forward_batch(c, toks + i, chunk);
+		if (!t) break;
+		lg = t;
+		i += chunk;
+	}
 	return lg;
 }
 
-/* Sample + stream a reply from the given starting logits. Stops on eos or cap. */
-static void generate(hakm_ctx *c, hakm_tok *tk, sampler *sp,
-                     const float *logits, int n_new) {
+/* Sample + stream a reply from the given starting logits. Stops on eos or cap.
+ * Returns tokens actually generated (callers report HONEST tok/s — counting
+ * the requested cap inflated the rate ~4x whenever eos came early). */
+static int generate(hakm_ctx *c, hakm_tok *tk, sampler *sp,
+                    const float *logits, int n_new) {
 	char buf[16];
-	for (int g = 0; g < n_new && c->pos < c->max_seq; g++) {
+	int g = 0;
+	for (; g < n_new && c->pos < c->max_seq; g++) {
 		int id = sample_token(sp, c->logits, c->vocab);
 		(void)logits;
 		if (id == tok_eos(tk)) break;
@@ -72,6 +96,24 @@ static void generate(hakm_ctx *c, hakm_tok *tk, sampler *sp,
 		hakm_forward(c, id);
 	}
 	putchar('\n');
+	return g;
+}
+
+/* One-shot prefill+decode with HONEST split timing. The combined (n+gen)/wall
+ * figure hid a slow decode behind a fast prefill (or vice-versa); report the
+ * prefill and decode rates separately, like the --serve path already does. */
+static void run_oneshot(hakm_ctx *c, hakm_tok *tk, sampler *sp,
+                        const int *buf, int n, int n_new) {
+	double t0 = wall();
+	const float *lg = feed(c, buf, n);
+	double t1 = wall();
+	int gen = generate(c, tk, sp, lg, n_new);
+	double t2 = wall();
+	double pt = t1 - t0, dt = t2 - t1;
+	fprintf(stderr,
+	        "[%.1fs wall: %d prefilled (%.1fs, %.2f tok/s) + %d generated (%.1fs, %.2f tok/s)]\n",
+	        t2 - t0, n, pt, pt > 0 ? n / pt : 0.0,
+	        gen, dt, dt > 0 ? gen / dt : 0.0);
 }
 
 /* Build a ChatML turn into buf: [im_start]role\n{text}[im_end]\n , optionally
@@ -90,13 +132,21 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 	return 0;
 }
 
+#ifndef HAKM_VERSION
+#define HAKM_VERSION "0.0.2"
+#endif
+
 int main(int argc, char **argv) {
+	if (argc >= 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
+		printf("hakm v%s\n", HAKM_VERSION);
+		return 0;
+	}
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <model.mlf2> [-n N -t F -p F -k N -s N --sys TEXT --raw --info] [PROMPT]\n", argv[0]);
+		fprintf(stderr, "usage: %s <model.mlf2> [-n N -t F -p F -k N -s N --sys TEXT --raw --info --serve --chat-stdin] [PROMPT]\n", argv[0]);
 		return 1;
 	}
 	const char *path = argv[1], *sys = NULL;
-	int n_new = 128, top_k = 40, info = 0, raw = 0, chat_stdin = 0;
+	int n_new = 128, top_k = 40, info = 0, raw = 0, chat_stdin = 0, serve = 0;
 	int max_seq = 2048;
 	float temp = 0.7f, top_p = 0.9f;
 	uint64_t seed = (uint64_t)time(NULL);
@@ -112,6 +162,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) max_seq = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--raw"))  raw = 1;
 		else if (!strcmp(argv[i], "--chat-stdin")) chat_stdin = 1;
+		else if (!strcmp(argv[i], "--serve")) serve = 1;
 		else if (!strcmp(argv[i], "--info")) info = 1;
 		else { if (prompt[0]) strncat(prompt, " ", sizeof(prompt) - strlen(prompt) - 1);
 		       strncat(prompt, argv[i], sizeof(prompt) - strlen(prompt) - 1); }
@@ -151,14 +202,112 @@ int main(int argc, char **argv) {
 		int n = 0;
 		if (push_text(tk, prompt, buf, &n, max_seq)) { fprintf(stderr, "encode failed\n"); return 1; }
 		fputs(prompt, stdout); fflush(stdout);
-		double t0 = wall();
-		const float *lg = feed(c, buf, n);
-		generate(c, tk, &sp, lg, n_new);
-		fprintf(stderr, "[%.1fs wall, %.2f tok/s]\n", wall() - t0, (n + n_new) / (wall() - t0));
+		run_oneshot(c, tk, &sp, buf, n, n_new);
 		goto done;
 	}
 
 	if (!chat_ok) { fprintf(stderr, "hakm: no ChatML special tokens; use --raw\n"); goto done; }
+
+	/* ── resident serve loop (persistent agent transport, KV cache reused) ──
+	   Same frame as --chat-stdin, repeated until EOF, with an optional
+	   per-request token cap on the header line ("N n_new\n"). Each request is
+	   the FULL conversation; we prefix-match its rendered tokens against what
+	   is already in the KV cache and prefill only the unseen tail — the system
+	   prompt and prior turns cost nothing after the first request. Reply is
+	   length-prefixed ("R <len>\n<bytes>"); errors use "E". */
+	if (serve) {
+		int *kv_toks = malloc(max_seq * sizeof(int));
+		int kv_n = 0;	/* tokens whose KV entries are valid; == c->pos between requests */
+		char hdr[64];
+		while (kv_toks && fgets(hdr, sizeof(hdr), stdin)) {
+			int nmsgs = 0, req_new = 0, mt = -1;
+			if (sscanf(hdr, "%d %d %d", &nmsgs, &req_new, &mt) < 1 || nmsgs <= 0) break;
+			if (req_new <= 0 || req_new > 65536) req_new = n_new;
+			/* Optional 3rd header field = per-request temperature in millis
+			   (mt/1000). The agent sends 0 on tool turns to force greedy
+			   sampling — same prompt → same tool call, every time. Absent (mt<0,
+			   old frames / --chat-stdin) leaves the CLI -t default untouched. */
+			if (mt >= 0) sp.temp = mt / 1000.0f;
+
+			int n = 0, overflow = 0, sync_lost = 0;
+			for (int i = 0; i < nmsgs; i++) {
+				char role[64];
+				if (!fgets(role, sizeof(role), stdin)) { sync_lost = 1; break; }
+				size_t rl = strlen(role); while (rl && (role[rl-1] == '\n' || role[rl-1] == '\r')) role[--rl] = 0;
+				if (!fgets(hdr, sizeof(hdr), stdin)) { sync_lost = 1; break; }
+				long clen = atol(hdr);
+				if (clen < 0) clen = 0;
+				char *content = malloc((size_t)clen + 1);
+				if (!content) { sync_lost = 1; break; }
+				size_t got = clen ? fread(content, 1, (size_t)clen, stdin) : 0;
+				content[got] = 0;
+				if (got != (size_t)clen) { free(content); sync_lost = 1; break; }
+				/* keep consuming the frame even after overflow so the stream stays synced */
+				if (!overflow && chatml_turn(tk, im_start, im_end, role, content, 0, buf, &n, max_seq))
+					overflow = 1;
+				free(content);
+			}
+			if (sync_lost) break;
+			if (!overflow && chatml_turn(tk, im_start, im_end, "assistant", NULL, 1, buf, &n, max_seq))
+				overflow = 1;
+			if (overflow) {
+				const char *msg = "conversation exceeds context window — trim history or raise --ctx";
+				printf("E %zu\n", strlen(msg)); fwrite(msg, 1, strlen(msg), stdout); fflush(stdout);
+				hakm_reset(c); kv_n = 0;
+				continue;
+			}
+
+			/* Prefix match, then roll the cache back to the divergence point.
+			   Clamp to n-1 so at least the last token is fed — generation needs
+			   its logits fresh. */
+			int p = 0;
+			while (p < kv_n && p < n - 1 && kv_toks[p] == buf[p]) p++;
+			c->pos = p;
+			double t0 = wall();
+			for (int i = p; i < n; i++) kv_toks[i] = buf[i];
+			feed(c, buf + p, n - p);   /* batched prefill of the unseen tail */
+			kv_n = n;
+			double t1 = wall();
+
+			/* Generate into a buffer; the reply ships length-prefixed in one piece. */
+			size_t ocap = 4096, olen = 0;
+			char *out = malloc(ocap);
+			int gen = 0;
+			char piece[16];
+			while (out && gen < req_new && c->pos < c->max_seq) {
+				int id = sample_token(&sp, c->logits, c->vocab);
+				if (id == tok_eos(tk)) break;
+				int w = tok_decode_id(tk, id, piece, sizeof(piece));
+				if (olen + (size_t)w >= ocap) {
+					char *t = realloc(out, ocap * 2);
+					if (!t) break;
+					out = t; ocap *= 2;
+				}
+				memcpy(out + olen, piece, (size_t)w); olen += (size_t)w;
+				hakm_forward(c, id);
+				kv_toks[kv_n++] = id;	/* keep kv_toks == fed tokens; kv_n tracks c->pos */
+				gen++;
+				/* Stop the moment a tool call closes. The agent's Qwen dialect is
+				   one <tool_call>…</tool_call> per turn: emit it, hand off, wait
+				   for the observation. Stopping here means a call can never be
+				   truncated mid-JSON by req_new, and no wasted "now run it in
+				   your terminal" epilogue burns tokens after the call.
+				   </write_file> is the raw-body file-write channel (no JSON
+				   escaping of the file content) — same one-shot, hand-off rule. */
+				if ((olen >= 12 && memcmp(out + olen - 12, "</tool_call>",  12) == 0) ||
+				    (olen >= 13 && memcmp(out + olen - 13, "</write_file>", 13) == 0)) break;
+			}
+			printf("R %zu\n", olen);
+			if (out) fwrite(out, 1, olen, stdout);
+			fflush(stdout);
+			free(out);
+			double t2 = wall();
+			fprintf(stderr, "[serve: %d cached + %d prefilled (%.1fs) + %d generated (%.1fs, %.2f tok/s)]\n",
+			        p, n - p, t1 - t0, gen, t2 - t1, gen > 0 ? gen / (t2 - t1) : 0.0);
+		}
+		free(kv_toks);
+		goto done;
+	}
 
 	/* ── one-shot framed conversation from stdin (agent subprocess wire) ──
 	   Frame: "N\n" then N × ( "role\n" "len\n" <len bytes> ). Reply → stdout
@@ -193,10 +342,7 @@ int main(int argc, char **argv) {
 		}
 		if (overflow) fprintf(stderr, "hakm: conversation truncated to ctx %d\n", max_seq);
 
-		double t0 = wall();
-		const float *lg = feed(c, buf, n);
-		generate(c, tk, &sp, lg, n_new);
-		fprintf(stderr, "[%.1fs wall, %.2f tok/s]\n", wall() - t0, (n + n_new) / (wall() - t0));
+		run_oneshot(c, tk, &sp, buf, n, n_new);
 		goto done;
 	}
 
@@ -206,10 +352,7 @@ int main(int argc, char **argv) {
 		if (sys) chatml_turn(tk, im_start, im_end, "system", sys, 0, buf, &n, max_seq);
 		chatml_turn(tk, im_start, im_end, "user", prompt, 0, buf, &n, max_seq);
 		chatml_turn(tk, im_start, im_end, "assistant", NULL, 1, buf, &n, max_seq);
-		double t0 = wall();
-		const float *lg = feed(c, buf, n);
-		generate(c, tk, &sp, lg, n_new);
-		fprintf(stderr, "[%.1fs wall, %.2f tok/s]\n", wall() - t0, (n + n_new) / (wall() - t0));
+		run_oneshot(c, tk, &sp, buf, n, n_new);
 		goto done;
 	}
 

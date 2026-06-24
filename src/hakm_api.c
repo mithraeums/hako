@@ -101,12 +101,17 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 	return 0;
 }
 
-/* Feed prompt tokens; return last logits (held in c->logits). */
+/* Feed prompt tokens in batched chunks; return last logits (in c->logits). */
 static const float *feed(hakm_ctx *c, const int *toks, int n)
 {
 	const float *lg = NULL;
-	for (int i = 0; i < n && c->pos < c->max_seq; i++)
-		lg = hakm_forward(c, toks[i]);
+	for (int i = 0; i < n && c->pos < c->max_seq; ) {
+		int chunk = n - i < 16 ? n - i : 16;
+		const float *t = hakm_forward_batch(c, toks + i, chunk);
+		if (!t) break;
+		lg = t;
+		i += chunk;
+	}
 	return lg;
 }
 

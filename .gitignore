@@ -6,6 +6,10 @@ test_quant
 test_api
 *.o
 *.a
+*.dSYM/
+
+# vhs recordings — internal tooling, not shipped (outputs live in the website repo)
+vhs/
 
 # Model weights — never in the repo (pulled from HuggingFace at runtime)
 *.mlf2

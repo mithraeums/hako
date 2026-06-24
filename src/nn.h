@@ -24,6 +24,19 @@ void matmul(float *out, const float *x,
             const hakm_model *m, const mlf2_tensor *w,
             const float *bias, int n_out, int n_in);
 
+/* Batched matmul: x is B activation rows (stride n_in), out is B result rows
+ * (stride n_out). Each weight row is read/dequantized once and dotted against
+ * all B activations while cache-hot — the prefill speedup over B GEMVs. */
+void matmul_batch(float *out, const float *x,
+                  const hakm_model *m, const mlf2_tensor *w,
+                  const float *bias, int n_out, int n_in, int B);
+
 /* Dequantize a single row r (length n_in) of tensor `w` into out[n_in].
  * Used for embedding lookup. */
 void deq_row(const hakm_model *m, const mlf2_tensor *w, int r, int n_in, float *out);
+
+/* Generic parallel-for over the persistent worker pool: runs fn on each
+ * element of jobs[njobs] (jsize bytes apart); caller's thread takes jobs[0].
+ * Same pool the matmuls use — do not nest. */
+void hakm_parallel(void (*fn)(void *), void *jobs, size_t jsize, int njobs);
+int  hakm_nthreads(void);
