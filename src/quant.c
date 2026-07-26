@@ -128,7 +128,11 @@ void dequant_q6_K(const void *blocks, float *out, int nelem) {
 
 /* ── int8-activation × int4-weight fast path ── */
 
-void quantize_row_q8_32(const float *x, int n, int8_t *xq, float *xs) {
+/* Quantize + also emit axs[k] = scale · Σ(quants) for 32-block k. The Q4_K min
+ * term is dmin·m·Σx, and Σx (hence scale·Σx) depends only on the activation — so
+ * folding it here once lets q4k_vec_dot skip the per-row Σx reduction AND the
+ * int→float convert in its hot loop, reusing axs across every weight row/thread. */
+void quantize_row_q8_32(const float *x, int n, int8_t *xq, float *xs, float *axs) {
 	for (int b = 0; b < n; b += 32) {
 		float amax = 0.0f;
 		for (int l = 0; l < 32; l++) {
@@ -138,26 +142,34 @@ void quantize_row_q8_32(const float *x, int n, int8_t *xq, float *xs) {
 		float scale = amax / 127.0f;
 		float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
 		xs[b >> 5] = scale;
+		int s = 0;
 		for (int l = 0; l < 32; l++) {
 			int v = (int)lrintf(x[b + l] * inv);
 			if (v >  127) v =  127;
 			if (v < -127) v = -127;
 			xq[b + l] = (int8_t)v;
+			s += v;
 		}
+		axs[b >> 5] = scale * (float)s;
 	}
 }
 
 /* One Q4_K row · int8 activation. For each 32-wide sub-block:
  *   dot += xs · ( d·s · Σ(q·xq)  −  dmin·m · Σ(xq) )
  * q is the 4-bit weight (0..15), s/m the 6-bit sub-block scale/min, d/dmin the
- * fp16 super-block scales. The two Σ are pure integer MACs (vectorizable). */
-float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs) {
+ * fp16 super-block scales. Σ(q·xq) is the per-row integer MAC; the min term is
+ * activation-only, so scale·Σ(xq) arrives precomputed as `axs` (per 32-block,
+ * reused across every weight row/thread) — the kernel just accumulates m·axs,
+ * skipping the second per-row Σx reduction. */
+float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq,
+                  const float *xs, const float *axs) {
 	const block_q4_K *b = (const block_q4_K *)w_row;
 	int nb = n_in / QK_K;
 	float acc = 0.0f;
-	int sb = 0;                       /* global 32-block index → xs[] */
+	int sb = 0;                       /* global 32-block index → xs[]/axs[] */
 #if defined(HAKM_AVX2) && defined(__FMA__)
-	__m256 facc = _mm256_setzero_ps();
+	__m256 facc = _mm256_setzero_ps();   /* +term: Σ d·s·(q·x), 8 lanes */
+	__m256 fmin = _mm256_setzero_ps();   /* -term: Σ dmin·m·(scale·Σx), 8 lanes */
 #endif
 
 	for (int i = 0; i < nb; i++) {
@@ -166,17 +178,21 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 		const uint8_t *q  = b[i].qs;
 		const uint8_t *sc = b[i].scales;
 		const int8_t  *xb = xq + (size_t)i * QK_K;
+#if defined(HAKM_AVX2) && defined(__FMA__)
+		float minf[8];                /* per-superblock m·axs, folded once below */
+#endif
 
 		int is = 0;
 		for (int g = 0; g < QK_K; g += 64) {
 			uint8_t s, m;
 #if !(defined(HAKM_AVX2) && defined(__FMA__))
-			int iqxA, ixA, iqxB, ixB;
+			int iqxA, iqxB;
 #endif
 
 #ifdef HAKM_NEON_DOTPROD
 			/* 64 weights (32 bytes) × 64 int8 activations via hardware sdot.
-			   Low nibbles → sub-block A (xb[g..g+31]); high → B (xb[g+32..g+63]). */
+			   Low nibbles → sub-block A (xb[g..g+31]); high → B (xb[g+32..g+63]).
+			   Min term rides the precomputed axs in the scalar fold — no ones-dot. */
 			const uint8x16_t q0 = vld1q_u8(q);
 			const uint8x16_t q1 = vld1q_u8(q + 16);
 			const uint8x16_t lo = vdupq_n_u8(0x0F);
@@ -188,24 +204,20 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 			const int8x16_t xA1 = vld1q_s8(xb + g + 16);
 			const int8x16_t xB0 = vld1q_s8(xb + g + 32);
 			const int8x16_t xB1 = vld1q_s8(xb + g + 48);
-			const int8x16_t ones = vdupq_n_s8(1);
 
-			int32x4_t aq = vdupq_n_s32(0), ax = vdupq_n_s32(0);
+			int32x4_t aq = vdupq_n_s32(0), bq = vdupq_n_s32(0);
 			aq = vdotq_s32(aq, loA0, xA0); aq = vdotq_s32(aq, loA1, xA1);
-			ax = vdotq_s32(ax, ones, xA0); ax = vdotq_s32(ax, ones, xA1);
-			iqxA = vaddvq_s32(aq); ixA = vaddvq_s32(ax);
-
-			int32x4_t bq = vdupq_n_s32(0), bx = vdupq_n_s32(0);
 			bq = vdotq_s32(bq, hiB0, xB0); bq = vdotq_s32(bq, hiB1, xB1);
-			bx = vdotq_s32(bx, ones, xB0); bx = vdotq_s32(bx, ones, xB1);
-			iqxB = vaddvq_s32(bq); ixB = vaddvq_s32(bx);
+			iqxA = vaddvq_s32(aq); iqxB = vaddvq_s32(bq);
 #elif defined(HAKM_AVX2) && defined(__FMA__)
 			/* FMA path: keep the 8-lane int32 partial sums as VECTORS and fold
-			   the per-subblock scales in float lanes — ONE horizontal sum per
-			   ROW (after the loop) instead of four per 64-weight group. The
-			   hsums were the bottleneck: the first AVX2 pass measured only
-			   +10% because of them. int32→float converts are exact here
-			   (lane sums ≤ 4·15·127 = 7620 < 2^24). */
+			   the per-subblock scale in float lanes — ONE horizontal sum per ROW.
+			   The +term (d·s·Σq·x) needs the per-row integer MAC; the -term
+			   (dmin·m·scale·Σx) is activation-only (axs) so only m·axs is
+			   computed per subblock (one scalar mul), then the whole superblock's
+			   8 are folded into fmin with a single vector fnmadd — no per-row Σx
+			   maddubs (frees half the port-0 MACs) and no serial scalar chain.
+			   int32→float converts are exact (lane sums ≤ 4·15·127 = 7620). */
 			{
 				const __m256i qv     = _mm256_loadu_si256((const __m256i *)q);
 				const __m256i lomask = _mm256_set1_epi8(0x0F);
@@ -213,25 +225,20 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 				const __m256i hiB  = _mm256_and_si256(_mm256_srli_epi16(qv, 4), lomask);
 				const __m256i xA   = _mm256_loadu_si256((const __m256i *)(xb + g));
 				const __m256i xB   = _mm256_loadu_si256((const __m256i *)(xb + g + 32));
-				const __m256i ones8  = _mm256_set1_epi8(1);
 				const __m256i ones16 = _mm256_set1_epi16(1);
 
 				const __m256i pA = _mm256_madd_epi16(_mm256_maddubs_epi16(lowA, xA), ones16);
-				const __m256i mA = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xA), ones16);
 				const __m256i pB = _mm256_madd_epi16(_mm256_maddubs_epi16(hiB,  xB), ones16);
-				const __m256i mB = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xB), ones16);
 
 				get_scale_min_k4(is + 0, sc, &s, &m);
 				facc = _mm256_fmadd_ps(_mm256_set1_ps(xs[sb] * d * s),
 				                       _mm256_cvtepi32_ps(pA), facc);
-				facc = _mm256_fnmadd_ps(_mm256_set1_ps(xs[sb] * dmin * m),
-				                        _mm256_cvtepi32_ps(mA), facc);
+				minf[is + 0] = (float)m * axs[sb];
 				sb++;
 				get_scale_min_k4(is + 1, sc, &s, &m);
 				facc = _mm256_fmadd_ps(_mm256_set1_ps(xs[sb] * d * s),
 				                       _mm256_cvtepi32_ps(pB), facc);
-				facc = _mm256_fnmadd_ps(_mm256_set1_ps(xs[sb] * dmin * m),
-				                        _mm256_cvtepi32_ps(mB), facc);
+				minf[is + 1] = (float)m * axs[sb];
 				sb++;
 			}
 			q  += 32;
@@ -241,8 +248,8 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 			/* 32 weight bytes → low nibbles = sub-block A (xb[g..g+31]),
 			   high nibbles = sub-block B (xb[g+32..g+63]). maddubs does the
 			   uint4×int8 MAC into int16 pairs (no saturation: max 15·127·2 =
-			   3810 < 32767); madd_epi16 folds pairs to int32; then hsum.
-			   Σxq uses maddubs against a vector of 1s. */
+			   3810 < 32767); madd_epi16 folds pairs to int32; then hsum. The min
+			   term uses precomputed axs (= scale·Σx), see the scalar fold. */
 			{
 				const __m256i qv     = _mm256_loadu_si256((const __m256i *)q);
 				const __m256i lomask = _mm256_set1_epi8(0x0F);
@@ -250,37 +257,42 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 				const __m256i hiB  = _mm256_and_si256(_mm256_srli_epi16(qv, 4), lomask);
 				const __m256i xA   = _mm256_loadu_si256((const __m256i *)(xb + g));
 				const __m256i xB   = _mm256_loadu_si256((const __m256i *)(xb + g + 32));
-				const __m256i ones8  = _mm256_set1_epi8(1);
 				const __m256i ones16 = _mm256_set1_epi16(1);
 
 				iqxA = hsum256_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lowA, xA), ones16));
 				iqxB = hsum256_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(hiB,  xB), ones16));
-				ixA  = hsum256_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xA), ones16));
-				ixB  = hsum256_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(ones8, xB), ones16));
 			}
 #else
-			iqxA = ixA = iqxB = ixB = 0;
+			iqxA = iqxB = 0;
 			for (int l = 0; l < 32; l++) {
 				int xa = xb[g + l], xbv = xb[g + 32 + l];
-				iqxA += (q[l] & 0xF) * xa; ixA += xa;
-				iqxB += (q[l] >> 4)  * xbv; ixB += xbv;
+				iqxA += (q[l] & 0xF) * xa;
+				iqxB += (q[l] >> 4)  * xbv;
 			}
 #endif
 #if !(defined(HAKM_AVX2) && defined(__FMA__))
+			/* +term needs the per-row integer MAC; -term folds precomputed
+			   axs = scale·Σx (so xs·(… − dmin·m·Σx) = … − dmin·m·axs). */
 			get_scale_min_k4(is + 0, sc, &s, &m);
-			acc += xs[sb++] * (d * s * (float)iqxA - dmin * m * (float)ixA);
+			acc += xs[sb] * d * s * (float)iqxA - dmin * m * axs[sb]; sb++;
 			get_scale_min_k4(is + 1, sc, &s, &m);
-			acc += xs[sb++] * (d * s * (float)iqxB - dmin * m * (float)ixB);
+			acc += xs[sb] * d * s * (float)iqxB - dmin * m * axs[sb]; sb++;
 
 			q  += 32;
 			is += 2;
 #endif
 		}
+#if defined(HAKM_AVX2) && defined(__FMA__)
+		/* fold this superblock's 8 min terms (m·axs) into fmin with one vector
+		   FMA — dmin is constant over the superblock. */
+		fmin = _mm256_fmadd_ps(_mm256_set1_ps(dmin), _mm256_loadu_ps(minf), fmin);
+#endif
 	}
 #if defined(HAKM_AVX2) && defined(__FMA__)
-	{	/* the one horizontal sum for the whole row */
-		__m128 lo = _mm_add_ps(_mm256_castps256_ps128(facc),
-		                       _mm256_extractf128_ps(facc, 1));
+	{	/* one horizontal sum per row: (Σ +term) − (Σ −term) */
+		__m256 v = _mm256_sub_ps(facc, fmin);
+		__m128 lo = _mm_add_ps(_mm256_castps256_ps128(v),
+		                       _mm256_extractf128_ps(v, 1));
 		lo = _mm_hadd_ps(lo, lo);
 		lo = _mm_hadd_ps(lo, lo);
 		acc += _mm_cvtss_f32(lo);

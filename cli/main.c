@@ -87,6 +87,7 @@ static int generate(hakm_ctx *c, hakm_tok *tk, sampler *sp,
                     const float *logits, int n_new) {
 	char buf[16];
 	int g = 0;
+	sampler_reset_hist(sp);
 	for (; g < n_new && c->pos < c->max_seq; g++) {
 		int id = sample_token(sp, c->logits, c->vocab);
 		(void)logits;
@@ -133,7 +134,7 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 }
 
 #ifndef HAKM_VERSION
-#define HAKM_VERSION "0.0.2"
+#define HAKM_VERSION "0.0.3"
 #endif
 
 int main(int argc, char **argv) {
@@ -142,13 +143,14 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <model.mlf2> [-n N -t F -p F -k N -s N --sys TEXT --raw --info --serve --chat-stdin] [PROMPT]\n", argv[0]);
+		fprintf(stderr, "usage: %s <model.mlf2> [-n N -t F -p F -k N --rep F --rep-window N -s N --sys TEXT --raw --info --serve --chat-stdin] [PROMPT]\n", argv[0]);
 		return 1;
 	}
 	const char *path = argv[1], *sys = NULL;
 	int n_new = 128, top_k = 40, info = 0, raw = 0, chat_stdin = 0, serve = 0;
 	int max_seq = 2048;
-	float temp = 0.7f, top_p = 0.9f;
+	float temp = 0.7f, top_p = 0.9f, rep = 1.0f;
+	int rep_win = 64;
 	uint64_t seed = (uint64_t)time(NULL);
 	char prompt[8192] = {0};
 
@@ -157,6 +159,8 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "-t") && i + 1 < argc) temp  = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "-p") && i + 1 < argc) top_p = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "-k") && i + 1 < argc) top_k = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--rep") && i + 1 < argc) rep = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--rep-window") && i + 1 < argc) rep_win = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-s") && i + 1 < argc) seed  = strtoull(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "--sys") && i + 1 < argc) sys = argv[++i];
 		else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) max_seq = atoi(argv[++i]);
@@ -191,6 +195,7 @@ int main(int argc, char **argv) {
 
 	hakm_tok *tk = tok_new(&c->model);
 	sampler sp; sampler_init(&sp, temp, top_p, top_k, seed);
+	sampler_set_rep(&sp, rep, rep_win);
 	int im_start = tok_id(tk, "<|im_start|>");
 	int im_end   = tok_id(tk, "<|im_end|>");
 	int chat_ok  = (im_start >= 0 && im_end >= 0);
@@ -274,6 +279,7 @@ int main(int argc, char **argv) {
 			char *out = malloc(ocap);
 			int gen = 0;
 			char piece[16];
+			sampler_reset_hist(&sp);
 			while (out && gen < req_new && c->pos < c->max_seq) {
 				int id = sample_token(&sp, c->logits, c->vocab);
 				if (id == tok_eos(tk)) break;

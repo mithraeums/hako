@@ -63,7 +63,8 @@ void deq_row(const hakm_model *m, const mlf2_tensor *w, int r, int n_in, float *
 typedef struct {
 	const hakm_model *m; const mlf2_tensor *w;
 	const float *x, *bias; float *out;
-	const int8_t *xq; const float *xs;   /* int8-quantized x for the Q4_K path */
+	const int8_t *xq; const float *xs;   /* int8-quantized x for the k-quant path */
+	const float *axs;                    /* per-32-block scale·Σx, Q4_K min term */
 	int r0, r1, n_in, type; size_t rb;
 	int B, n_out;                        /* batch rows in x/out; out row stride */
 } mm_job;
@@ -85,8 +86,9 @@ static void mm_worker(void *arg) {
 			for (int b = 0; b < j->B; b++) {
 				const int8_t *xqb = j->xq + (size_t)b * j->n_in;
 				const float  *xsb = j->xs + (size_t)b * xsn;
+				const float  *axb = j->axs + (size_t)b * xsn;
 				float acc = q6 ? q6k_vec_dot(row, j->n_in, xqb, xsb)
-				               : q4k_vec_dot(row, j->n_in, xqb, xsb);
+				               : q4k_vec_dot(row, j->n_in, xqb, xsb, axb);
 				float *o = j->out + (size_t)b * j->n_out;
 				o[r] = j->bias ? acc + j->bias[r] : acc;
 			}
@@ -209,17 +211,19 @@ void matmul_batch(float *out, const float *x,
 	/* For the k-quant fast paths, quantize all B activation rows once and
 	   share them across all output rows / threads (read-only). n_in is always
 	   a multiple of 32. */
-	const int8_t *xqp = NULL; const float *xsp = NULL;
-	int8_t *xq = NULL; float *xs = NULL;
+	const int8_t *xqp = NULL; const float *xsp = NULL; const float *axsp = NULL;
+	int8_t *xq = NULL; float *xs = NULL; float *axs = NULL;
 	if ((int)w->type == MLF2_TYPE_Q4_K || (int)w->type == MLF2_TYPE_Q6_K) {
 		/* heap-sized to n_in (multiple of 32) so it scales past the 3B; a fixed
 		   stack buffer overflowed on the 7B's ffn_dim (18944). */
-		xq = malloc((size_t)B * n_in);
-		xs = malloc((size_t)B * (n_in / 32) * sizeof(float));
+		xq  = malloc((size_t)B * n_in);
+		xs  = malloc((size_t)B * (n_in / 32) * sizeof(float));
+		axs = malloc((size_t)B * (n_in / 32) * sizeof(float));
 		for (int b = 0; b < B; b++)
 			quantize_row_q8_32(x + (size_t)b * n_in, n_in,
-			                   xq + (size_t)b * n_in, xs + (size_t)b * (n_in / 32));
-		xqp = xq; xsp = xs;
+			                   xq + (size_t)b * n_in, xs + (size_t)b * (n_in / 32),
+			                   axs + (size_t)b * (n_in / 32));
+		xqp = xq; xsp = xs; axsp = axs;
 	}
 
 	mm_job jb[MM_MAXT];
@@ -228,10 +232,10 @@ void matmul_batch(float *out, const float *x,
 		int r0 = t * per, r1 = r0 + per;
 		if (r1 > n_out) r1 = n_out;
 		if (r0 >= r1) break;
-		jb[nt++] = (mm_job){ m, w, x, bias, out, xqp, xsp, r0, r1, n_in, (int)w->type, rb, B, n_out };
+		jb[nt++] = (mm_job){ m, w, x, bias, out, xqp, xsp, axsp, r0, r1, n_in, (int)w->type, rb, B, n_out };
 	}
 	hakm_parallel(mm_worker, jb, sizeof(mm_job), nt);
-	free(xq); free(xs);
+	free(xq); free(xs); free(axs);
 }
 
 void matmul(float *out, const float *x,

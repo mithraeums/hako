@@ -36,6 +36,10 @@ $(LIBA): $(EMBED_OBJ)
 test_quant: tests/test_quant.c src/loader.c src/quant.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# validate the fused Q4_K int8 dot (SIMD + Σx hoist) vs a scalar reference
+test_kdot: tests/test_kdot.c src/loader.c src/quant.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 # smoke the optional in-process embed API (hakm_chat). NB the agent uses the
 # hakm subprocess, not this — this only exercises the embeddable library.
 test_api: tests/test_api.c $(LIB)
@@ -46,7 +50,7 @@ test_api: tests/test_api.c $(LIB)
 	@echo "run: python3 tools/gguf2mlf.py <model.gguf> $@"
 
 clean:
-	rm -f hakm test_quant test_api $(LIBA) $(EMBED_OBJ) $(OBJ)
+	rm -f hakm test_quant test_kdot test_api $(LIBA) $(EMBED_OBJ) $(OBJ)
 
 .PHONY: all clean lib
 lib: $(LIBA)

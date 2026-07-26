@@ -25,6 +25,8 @@ typedef struct {
 	float    top_p;   /* nucleus; 0 => off (default 0.9) */
 	int      top_k;   /* top-k; 0 => off (default 40) */
 	uint64_t seed;    /* rng seed; 0 => time-seeded */
+	float    rep_penalty; /* repetition penalty; <=1 => off (default off) */
+	int      rep_window;  /* recent tokens penalized (default 64) */
 } hakm_params;
 
 void hakm_params_default(hakm_params *p);

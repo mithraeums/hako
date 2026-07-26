@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/engine-v0.0.2-b89656?style=flat-square&labelColor=14130f" alt="v0.0.2"/></a>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/engine-v0.0.3-b89656?style=flat-square&labelColor=14130f" alt="v0.0.3"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/deps-libc%20%2B%20libm%20%2B%20pthread-c8c2b2?style=flat-square&labelColor=14130f" alt="deps"/>
   <img src="https://img.shields.io/badge/runtime-no%20llama.cpp%20%C2%B7%20no%20ollama-c8c2b2?style=flat-square&labelColor=14130f" alt="no llama.cpp / no ollama"/>
@@ -124,10 +124,11 @@ M=~/.hako/models/hako-sho/hako-sho.mlf2
 ./hakm "$M" --raw -t 0 "def fibonacci(n):"           # raw greedy completion
 ./hakm "$M" --sys "You are hako." "ring buffers in C" # one ChatML turn
 ./hakm "$M" --sys "You are hako."                    # interactive multi-turn REPL
-./hakm --version                                     # hakm v0.0.2
+./hakm --version                                     # hakm v0.0.3
 ```
 
 Flags: `-n` new-tokens · `-t` temp (0 = greedy) · `-p` top_p · `-k` top_k ·
+`--rep F` repetition penalty (1 = off) · `--rep-window N` (default 64) ·
 `-s` seed · `--sys TEXT` · `--ctx N` · `--raw` · `--info` · `--chat-stdin` · `--serve`.
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
@@ -190,6 +191,10 @@ CPU-only, measured on a 4-core **i3-8100** (the staging box itself):
 - **Batched prefill ~4.7×** — `matmul_batch` streams each weight row from RAM
   once per batch (hot in L1 for the other B−1 dots); the FMA q4k kernel keeps
   8-lane int32 partials vectorized with one hsum per row.
+- **Prefill ~1.3× on top of that** (compute-bound once weight streaming is
+  amortized) — the q4k min term (`dmin·m·Σx`) is activation-only, so `scale·Σx`
+  is folded once per activation and reused across every weight row, freeing half
+  the per-group port-0 MACs. Greedy output stays bit-identical.
 - **Warm agent turns ~3–5s** (were 5+ minutes) — `--serve` keeps the model
   resident and reuses the KV prefix, so only the new tail prefills.
 - **7B (`hako-koi`) is viable on 8GB** — ~4 tok/s decode, RSS ~4.4GB.
@@ -198,13 +203,26 @@ Honest framing: the int8 paths keep weights exact (greedy output is
 bit-identical to the float path), and the `tok/s` print **splits prefill from
 decode** rather than blending them. Decode is near the box's bandwidth/compute
 floor; the next jumps are speculative decode (needs a draft model) or a
-prefill GEMM micro-kernel — not more threads.
+register-blocked prefill GEMM micro-kernel (amortize the weight nibble-unpack
+across batch columns) — not more threads.
 
 <p align="center"><sub><b>—— VI ——</b></sub></p>
 
 ## Change Log
 
-### engine v0.0.2 (Latest)
+### engine v0.0.3 (Latest)
+
+- **Prefill min-term hoist** — the q4k `dmin·m·Σx` term is activation-only, so
+  `scale·Σx` is precomputed once per activation and reused across every weight
+  row/thread. Frees half the per-group port-0 MACs → **~1.3× prefill** on the
+  i3, greedy output bit-identical (validated by `make test_kdot`).
+- **Repetition penalty** — `--rep F` / `--rep-window N` (and API `rep_penalty`);
+  **default off** to keep greedy tool-call turns deterministic.
+- **OOM hardening** — `hakm_ctx_new` guards the per-layer + scratch allocations
+  and fails to a clean error instead of segfaulting under RAM pressure.
+- **`--version` / `-v`** → `hakm v0.0.3`.
+
+### engine v0.0.2
 
 - **`--serve`** — resident framed-request loop with **KV prefix reuse**; warm
   agent turns in seconds instead of re-prefilling every turn.

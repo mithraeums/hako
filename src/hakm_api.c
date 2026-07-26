@@ -28,6 +28,8 @@ void hakm_params_default(hakm_params *p)
 	p->top_p = 0.9f;
 	p->top_k = 40;
 	p->seed  = 0;
+	p->rep_penalty = 1.0f;   /* off by default — keeps greedy tool-call output exact */
+	p->rep_window  = 64;
 }
 
 hakm_session *hakm_session_open(const char *mlf2_path, int max_seq)
@@ -155,6 +157,7 @@ int hakm_chat(hakm_session *s, const hakm_msg *msgs, int n_msgs,
 
 	sampler sp;
 	sampler_init(&sp, p->temp, p->top_p, p->top_k, p->seed);
+	sampler_set_rep(&sp, p->rep_penalty, p->rep_window);
 
 	int eos = tok_eos(tk);
 	int produced = 0;

@@ -37,6 +37,7 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 		c->out_weight = need(&c->model, "output.weight");
 
 	c->layers = calloc(c->n_layers, sizeof(layer_t));
+	if (!c->layers) { hakm_ctx_free(c); return NULL; }
 	int ok = (c->tok_embd && c->out_norm && c->out_weight);
 	char nm[64];
 	for (int l = 0; l < c->n_layers; l++) {
@@ -72,7 +73,9 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 	c->k_cache  = calloc((size_t)c->n_layers * max_seq * KV, sizeof(hakm_kv_t));
 	c->v_cache  = calloc((size_t)c->n_layers * max_seq * KV, sizeof(hakm_kv_t));
 	c->att_scores = calloc((size_t)hakm_nthreads() * max_seq, sizeof(float));
-	if (!c->k_cache || !c->v_cache || !c->logits || !c->att_scores) { hakm_ctx_free(c); return NULL; }
+	if (!c->xb || !c->xn || !c->q || !c->k || !c->v || !c->att_out ||
+	    !c->gate_buf || !c->up_buf || !c->deq ||
+	    !c->k_cache || !c->v_cache || !c->logits || !c->att_scores) { hakm_ctx_free(c); return NULL; }
 	return c;
 }
 
