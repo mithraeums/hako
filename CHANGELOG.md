@@ -11,6 +11,7 @@ ships together with hako-code v0.2.4 (token streaming and the model paths span b
 
 ### fixed
 - **the ARM builds did not compile** (linux-arm64, macos-universal): the Q8_0 NEON path used `<arm_neon.h>` only when the compiler had the dot-product extension, and the release targets baseline armv8-a; included for every NEON build now, and `make arm-check` compiles all of it for arm64 on a Mac before a tag
+- **Q8_0 on ARM without the dot-product extension summed wrong** on large weights: four int8 products were stacked in one 16-bit lane (up to 4 x 16384) and overflowed; each product is widened to 32 bits now (bit-exact emulation: 530/20000 random blocks wrong before, 0 after; the macOS runner caught it)
 - in a terminal the timing line could land on the same line as the answer (`Program crashes.[7.5s wall: …]`): the closing newline sat in stdout's buffer while the stats went straight to stderr. flushed first now
 
 ### changed

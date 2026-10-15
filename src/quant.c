@@ -462,11 +462,12 @@ float q8_0_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *x
 		s = vdotq_s32(s, w0, x0);
 		s = vdotq_s32(s, w1, x1);
 #else
-		int16x8_t p = vmull_s8(vget_low_s8(w0), vget_low_s8(x0));
-		p = vmlal_s8(p, vget_high_s8(w0), vget_high_s8(x0));
-		p = vmlal_s8(p, vget_low_s8(w1),  vget_low_s8(x1));
-		p = vmlal_s8(p, vget_high_s8(w1), vget_high_s8(x1));
-		s = vpadalq_s16(s, p);
+		/* One product per 16-bit lane, widened to 32 bits right away: stacking four
+		   (up to 4 x 16384) in one int16 lane overflowed on large weights. */
+		s = vpadalq_s16(s, vmull_s8(vget_low_s8(w0),  vget_low_s8(x0)));
+		s = vpadalq_s16(s, vmull_s8(vget_high_s8(w0), vget_high_s8(x0)));
+		s = vpadalq_s16(s, vmull_s8(vget_low_s8(w1),  vget_low_s8(x1)));
+		s = vpadalq_s16(s, vmull_s8(vget_high_s8(w1), vget_high_s8(x1)));
 #endif
 		acc += f16_to_f32(b[i].d) * xs[i] * (float)vaddvq_s32(s);
 	}
