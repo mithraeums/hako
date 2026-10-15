@@ -12,8 +12,10 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>       /* every NEON path needs it, not only the dot-product one */
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
-#include <arm_neon.h>
 #define HAKM_NEON_DOTPROD 1
 #elif defined(__AVX2__)
 #include <immintrin.h>

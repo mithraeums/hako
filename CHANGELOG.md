@@ -10,6 +10,7 @@ ships together with hako-code v0.2.4 (token streaming and the model paths span b
 - README banner and badges in the new inks (the suite's new look: two inks, ultramarine and vermilion, on washi, printed the way a risograph misprints)
 
 ### fixed
+- **the ARM builds did not compile** (linux-arm64, macos-universal): the Q8_0 NEON path used `<arm_neon.h>` only when the compiler had the dot-product extension, and the release targets baseline armv8-a; included for every NEON build now, and `make arm-check` compiles all of it for arm64 on a Mac before a tag
 - in a terminal the timing line could land on the same line as the answer (`Program crashes.[7.5s wall: …]`): the closing newline sat in stdout's buffer while the stats went straight to stderr. flushed first now
 
 ### changed

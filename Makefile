@@ -115,5 +115,16 @@ clean:
 	rm -rf hakm $(B) $(LIBA) $(EMBED_OBJ) $(OBJ)
 	rm -rf test_quant test_kdot test_api test_kvc test_attn test_q8 test_load *.dSYM
 
-.PHONY: all clean lib test $(TESTS)
+# The NEON paths, compiled for arm64 with warnings as errors. x86 builds never see that
+# code, and v0.0.4's first tag failed on both ARM builders for a missing include.
+# Needs a clang that can target arm64 (Apple's can); elsewhere it says so and passes.
+arm-check:
+	@if ! printf 'int x;' | $(CC) -target arm64-apple-macos11 -x c -c - -o /dev/null 2>/dev/null; then \
+		echo "arm-check: this compiler cannot target arm64, skipped"; exit 0; fi; \
+	for m in armv8-a armv8.2-a+dotprod; do for f in src/*.c cli/*.c tests/*.c; do \
+		$(CC) -target arm64-apple-macos11 -march=$$m -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Werror \
+			-Iinclude -Isrc -c $$f -o /dev/null || exit 1; done; done; \
+	echo "arm-check: every NEON path compiles for arm64 (armv8-a and +dotprod)"
+
+.PHONY: all clean lib test arm-check $(TESTS)
 lib: $(LIBA)
