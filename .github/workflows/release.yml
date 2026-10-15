@@ -56,6 +56,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ASan/UBSan unit gates on the runner's own CPU, before the release build.
+      - name: Test
+        run: make test
+
       - name: Build hakm
         run: |
           make ARCH="${{ matrix.arch }}"

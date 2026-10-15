@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * quant.h — dequantization for the k-quant subset Qwen2.5 Q4_K_M uses.
  * Block layouts mirror ggml exactly (we copy blocks verbatim, own the math).
@@ -23,11 +24,18 @@ typedef struct {
 	uint16_t d;          /* fp16 super-block scale */
 } block_q6_K;            /* 210 bytes */
 
+typedef struct {
+	uint16_t d;          /* fp16 block scale */
+	int8_t   qs[32];     /* 32 int8 quants */
+} block_q8_0;            /* 34 bytes — what small models (dims not a multiple
+                            of 256) and every "Q8_0" GGUF are made of */
+
 float f16_to_f32(uint16_t h);
 
 /* Dequantize `nelem` values (nelem must be a multiple of QK_K) into `out`. */
 void dequant_q4_K(const void *blocks, float *out, int nelem);
 void dequant_q6_K(const void *blocks, float *out, int nelem);
+void dequant_q8_0(const void *blocks, float *out, int nelem);   /* nelem multiple of 32 */
 
 /* Type-dispatched dequant. `type` is an enum mlf2_type. F32 = memcpy view,
  * F16 = widen. Returns 0 on success, -1 on unsupported type. */
@@ -53,3 +61,6 @@ float q4k_vec_dot(const void *w_row, int n_in, const int8_t *xq,
  * (attn_v, some ffn_down, lm_head on 7B+); without this it rides the
  * dequant-whole-row float path — the biggest decode cost after the Q4 path. */
 float q6k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs);
+
+/* Q8_0 row · int8 activation: int8×int8 per 32-block, one scale each side. */
+float q8_0_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs);

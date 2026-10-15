@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* sample.c — greedy / temperature / top-k / top-p sampling + rep penalty. */
 #include "sample.h"
 #include "nn.h"          /* softmax */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* nn.c — kernels: rmsnorm, softmax, silu, neox-rope, threaded quant matmul. */
 #include "nn.h"
 #include "quant.h"
@@ -41,6 +42,17 @@ void rope_neox(float *vec, int head_dim, int pos, float theta) {
 	}
 }
 
+void rope_norm(float *vec, int head_dim, int pos, float theta) {
+	for (int i = 0; i < head_dim; i += 2) {
+		float freq = powf(theta, -((float)i / (float)head_dim));
+		float ang  = (float)pos * freq;
+		float c = cosf(ang), s = sinf(ang);
+		float a = vec[i], b = vec[i + 1];
+		vec[i]     = a * c - b * s;
+		vec[i + 1] = a * s + b * c;
+	}
+}
+
 /* bytes occupied by one row of n_in elements of the given type. */
 static size_t row_nbytes(int type, int n_in) {
 	switch (type) {
@@ -48,6 +60,7 @@ static size_t row_nbytes(int type, int n_in) {
 	case MLF2_TYPE_F16:  return (size_t)n_in * 2;
 	case MLF2_TYPE_Q4_K: return (size_t)(n_in / QK_K) * 144;
 	case MLF2_TYPE_Q6_K: return (size_t)(n_in / QK_K) * 210;
+	case MLF2_TYPE_Q8_0: return (size_t)(n_in / 32) * 34;
 	default:             return 0;
 	}
 }
@@ -78,16 +91,17 @@ static void mm_worker(void *arg) {
 	   purpose: one weight row (~1.1 KB at d_model 2048) is read from RAM once and
 	   dotted against all B activations while hot in L1 — this is what makes
 	   batched prefill faster than B separate GEMVs. */
-	if (j->type == MLF2_TYPE_Q4_K || j->type == MLF2_TYPE_Q6_K) {
+	if (j->type == MLF2_TYPE_Q4_K || j->type == MLF2_TYPE_Q6_K || j->type == MLF2_TYPE_Q8_0) {
 		int xsn = j->n_in / 32;
-		int q6 = (j->type == MLF2_TYPE_Q6_K);
+		int q6 = (j->type == MLF2_TYPE_Q6_K), q8 = (j->type == MLF2_TYPE_Q8_0);
 		for (int r = j->r0; r < j->r1; r++) {
 			const unsigned char *row = base + (size_t)r * j->rb;
 			for (int b = 0; b < j->B; b++) {
 				const int8_t *xqb = j->xq + (size_t)b * j->n_in;
 				const float  *xsb = j->xs + (size_t)b * xsn;
 				const float  *axb = j->axs + (size_t)b * xsn;
-				float acc = q6 ? q6k_vec_dot(row, j->n_in, xqb, xsb)
+				float acc = q8 ? q8_0_vec_dot(row, j->n_in, xqb, xsb)
+				          : q6 ? q6k_vec_dot(row, j->n_in, xqb, xsb)
 				               : q4k_vec_dot(row, j->n_in, xqb, xsb, axb);
 				float *o = j->out + (size_t)b * j->n_out;
 				o[r] = j->bias ? acc + j->bias[r] : acc;
@@ -213,7 +227,7 @@ void matmul_batch(float *out, const float *x,
 	   a multiple of 32. */
 	const int8_t *xqp = NULL; const float *xsp = NULL; const float *axsp = NULL;
 	int8_t *xq = NULL; float *xs = NULL; float *axs = NULL;
-	if ((int)w->type == MLF2_TYPE_Q4_K || (int)w->type == MLF2_TYPE_Q6_K) {
+	if ((int)w->type == MLF2_TYPE_Q4_K || (int)w->type == MLF2_TYPE_Q6_K || (int)w->type == MLF2_TYPE_Q8_0) {
 		/* heap-sized to n_in (multiple of 32) so it scales past the 3B; a fixed
 		   stack buffer overflowed on the 7B's ffn_dim (18944). */
 		xq  = malloc((size_t)B * n_in);

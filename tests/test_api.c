@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* test_api.c — smoke the in-process hakm_api.
  *
  *   ./test_api <model.mlf2> ["user prompt"]

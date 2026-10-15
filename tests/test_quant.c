@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * test_quant.c — dequant a tensor from an MLF2 file and dump floats.
  *

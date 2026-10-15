@@ -9,19 +9,20 @@ dequant math. See ../include/mlf2.h for the on-disk format.
 Usage:
     python3 gguf2mlf.py <model.gguf> <out.mlf2>
 
-Supported arch: qwen2.  Supported tensor types: F32, F16, Q4_K, Q6_K
+Supported arch: qwen2, llama (GPT-2 BPE tokenizer only).  Supported tensor types: F32, F16, Q8_0, Q4_K, Q6_K
 (the exact set Qwen2.5-Coder Q4_K_M ships).
 """
 import struct, sys, os
 
 # ── ggml type ids (mirrored in mlf2.h) ───────────────────────────────────────
-GGML_F32, GGML_F16, GGML_Q4_K, GGML_Q6_K = 0, 1, 12, 14
-TYPE_NAME = {GGML_F32: "F32", GGML_F16: "F16", GGML_Q4_K: "Q4_K", GGML_Q6_K: "Q6_K"}
+GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q4_K, GGML_Q6_K = 0, 1, 8, 12, 14
+TYPE_NAME = {GGML_F32: "F32", GGML_F16: "F16", GGML_Q8_0: "Q8_0", GGML_Q4_K: "Q4_K", GGML_Q6_K: "Q6_K"}
 QK_K = 256
 # bytes per block of QK_K=256 elements (or per element for F32/F16)
 def type_nbytes(t, nelem):
     if t == GGML_F32:  return 4 * nelem
     if t == GGML_F16:  return 2 * nelem
+    if t == GGML_Q8_0: return (nelem // 32) * 34
     if t == GGML_Q4_K: return (nelem // QK_K) * 144
     if t == GGML_Q6_K: return (nelem // QK_K) * 210
     raise SystemExit(f"unsupported tensor type {t}")
@@ -84,10 +85,16 @@ def main():
     md, tensors, data_start, g = load_gguf(src)
 
     arch = md["general.architecture"].decode()
-    if arch != "qwen2":
-        raise SystemExit(f"unsupported arch {arch!r} (only qwen2)")
+    ARCHES = {"qwen2": 0, "llama": 1}
+    if arch not in ARCHES:
+        raise SystemExit(f"unsupported arch {arch!r} (one of {sorted(ARCHES)})")
+    tokmodel = md.get("tokenizer.ggml.model", b"gpt2").decode()
+    if tokmodel != "gpt2":
+        raise SystemExit(f"unsupported tokenizer {tokmodel!r}: the engine speaks GPT-2 byte-level BPE "
+                         f"(qwen2, llama-3, smollm). SentencePiece models (llama-2, tinyllama, mistral) "
+                         f"need a second tokenizer — not written yet.")
 
-    def m(key): return md[f"qwen2.{key}"]
+    def m(key): return md[f"{arch}.{key}"]
     n_layers   = m("block_count")
     d_model    = m("embedding_length")
     n_heads    = m("attention.head_count")
@@ -95,7 +102,7 @@ def main():
     ffn_dim    = m("feed_forward_length")
     ctx        = m("context_length")
     rms_eps    = m("attention.layer_norm_rms_epsilon")
-    rope_theta = md.get("qwen2.rope.freq_base", 1000000.0)
+    rope_theta = md.get(f"{arch}.rope.freq_base", 1000000.0 if arch == "qwen2" else 10000.0)
     head_dim   = d_model // n_heads
 
     names = {t["name"] for t in tensors}
@@ -153,7 +160,7 @@ def main():
     with open(dst, "wb") as o:
         hdr = struct.pack(
             "<4sIIIIIIIIIIffII QQQ II 36s",
-            b"MLF2", 2, 0,
+            b"MLF2", 2, ARCHES[arch],
             n_layers, d_model, n_heads, n_kv_heads, head_dim,
             ffn_dim, ctx, vocab,
             float(rope_theta), float(rms_eps), flags, len(tensors),

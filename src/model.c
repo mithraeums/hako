@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* model.c — Qwen2 incremental forward pass with KV cache. */
 #include "model.h"
 #include "nn.h"
@@ -7,6 +8,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* One forward pass, two RoPE pairings; the header says which. */
+#define ROPE(v, hd, pos, th) \
+	((c->model.h.arch == MLF2_ARCH_LLAMA) ? rope_norm((v), (hd), (pos), (th)) \
+	                                      : rope_neox((v), (hd), (pos), (th)))
 
 static const mlf2_tensor *need(const hakm_model *m, const char *name) {
 	const mlf2_tensor *t = mlf2_find(m, name);
@@ -85,7 +91,7 @@ void hakm_ctx_free(hakm_ctx *c) {
 	free(c->att_out); free(c->gate_buf); free(c->up_buf); free(c->deq);
 	free(c->logits); free(c->k_cache); free(c->v_cache);
 	free(c->bxb); free(c->bxn); free(c->bq); free(c->bk); free(c->bv);
-	free(c->batt); free(c->bgate); free(c->bup);
+	free(c->batt); free(c->bgate); free(c->bup); free(c->bscores);
 	free(c->att_scores);
 	mlf2_close(&c->model);
 	free(c);
@@ -195,12 +201,12 @@ static void att_heads(hakm_ctx *c, int l, int pos, const float *q,
 static void att_batch_run(void *arg) {
 	att_job *j = (att_job *)arg;
 	hakm_ctx *c = j->c;
-	int D = c->d_model, F = c->ffn_dim;
+	int D = c->d_model;
 	for (int b = j->b0; b < j->b1; b++) {
 		float *att = c->batt + (size_t)b * D;
 		memset(att, 0, D * sizeof(float));
 		att_heads(c, j->l, j->pos0 + b, c->bq + (size_t)b * D,
-		          0, c->n_heads, att, c->bgate + (size_t)b * F);
+		          0, c->n_heads, att, c->bscores + (size_t)b * c->max_seq);
 	}
 }
 
@@ -228,8 +234,8 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 		matmul(c->v, c->xn, &c->model, L->wv, L->bv ? fdata(c, L->bv) : NULL, KV, D);
 
 		/* 2c. rope (neox) on each head of q and k */
-		for (int h = 0; h < H;   h++) rope_neox(c->q + h * hd, hd, pos, c->rope_theta);
-		for (int h = 0; h < KVH; h++) rope_neox(c->k + h * hd, hd, pos, c->rope_theta);
+		for (int h = 0; h < H;   h++) ROPE(c->q + h * hd, hd, pos, c->rope_theta);
+		for (int h = 0; h < KVH; h++) ROPE(c->k + h * hd, hd, pos, c->rope_theta);
 
 		/* 2d. write k,v into cache at this position */
 		kv_store(c->k_cache + ((size_t)l * c->max_seq + pos) * KV, c->k, KV);
@@ -252,7 +258,10 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 			}
 			hakm_parallel(att_decode_run, aj, sizeof(att_job), nj);
 		} else {
-			att_heads(c, l, pos, c->q, 0, H, c->att_out, c->gate_buf);
+			/* att_scores is nthreads*max_seq, so slice 0 is always a full-length
+			   scores row. gate_buf is ffn_dim and was too small whenever a model
+			   had ffn_dim < ctx — every model smaller than sho. */
+			att_heads(c, l, pos, c->q, 0, H, c->att_out, c->att_scores);
 		}
 
 		/* 2f. output proj, residual */
@@ -283,7 +292,7 @@ static int batch_scratch(hakm_ctx *c, int cap) {
 	if (cap <= c->batch_cap) return 0;
 	int D = c->d_model, F = c->ffn_dim, KV = c->kv_dim;
 	free(c->bxb); free(c->bxn); free(c->bq); free(c->bk); free(c->bv);
-	free(c->batt); free(c->bgate); free(c->bup);
+	free(c->batt); free(c->bgate); free(c->bup); free(c->bscores);
 	c->bxb  = malloc((size_t)cap * D  * sizeof(float));
 	c->bxn  = malloc((size_t)cap * D  * sizeof(float));
 	c->bq   = malloc((size_t)cap * D  * sizeof(float));
@@ -292,8 +301,9 @@ static int batch_scratch(hakm_ctx *c, int cap) {
 	c->batt = malloc((size_t)cap * D  * sizeof(float));
 	c->bgate = malloc((size_t)cap * F * sizeof(float));
 	c->bup   = malloc((size_t)cap * F * sizeof(float));
+	c->bscores = malloc((size_t)cap * c->max_seq * sizeof(float));
 	if (!c->bxb || !c->bxn || !c->bq || !c->bk || !c->bv ||
-	    !c->batt || !c->bgate || !c->bup) { c->batch_cap = 0; return -1; }
+	    !c->batt || !c->bgate || !c->bup || !c->bscores) { c->batch_cap = 0; return -1; }
 	c->batch_cap = cap;
 	return 0;
 }
@@ -327,8 +337,8 @@ const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
 		/* 2c. rope + 2d. cache write, per token */
 		for (int b = 0; b < n; b++) {
 			float *qb = c->bq + (size_t)b * D, *kb = c->bk + (size_t)b * KV;
-			for (int h = 0; h < H;   h++) rope_neox(qb + h * hd, hd, pos0 + b, c->rope_theta);
-			for (int h = 0; h < KVH; h++) rope_neox(kb + h * hd, hd, pos0 + b, c->rope_theta);
+			for (int h = 0; h < H;   h++) ROPE(qb + h * hd, hd, pos0 + b, c->rope_theta);
+			for (int h = 0; h < KVH; h++) ROPE(kb + h * hd, hd, pos0 + b, c->rope_theta);
 			kv_store(c->k_cache + ((size_t)l * c->max_seq + pos0 + b) * KV, kb, KV);
 			kv_store(c->v_cache + ((size_t)l * c->max_seq + pos0 + b) * KV, c->bv + (size_t)b * KV, KV);
 		}

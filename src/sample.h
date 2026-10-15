@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* sample.h — logit sampling: greedy, temperature, top-k, top-p, rep penalty. */
 #pragma once
 #include <stdint.h>
