@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* hakm_api.h — in-process inference API.
  *
  * One header to embed the hako engine directly inside another program (the

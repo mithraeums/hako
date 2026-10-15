@@ -2,8 +2,7 @@
 
 # Engine build artifacts
 hakm
-test_quant
-test_api
+build/
 *.o
 *.a
 *.dSYM/
@@ -18,14 +17,6 @@ vhs/
 *.bin
 *.pt
 *.safetensors
-
-# Model production: recipes + scratch kept LOCAL, not published here.
-# (sho/ koi/ fine-tune recipes move to their own repo when training starts;
-#  experimental/ is from-scratch research.)
-sho/
-koi/
-experimental/
-data/
 
 # Python
 __pycache__/
@@ -42,3 +33,5 @@ dist/
 .idea/
 .vscode/
 *.swp
+*.bak
+*.orig

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * quant.c — k-quant dequant (Q4_K, Q6_K) + fp16 widen.
  *
@@ -409,6 +410,73 @@ int dequant_tensor(int type, const void *src, float *out, int nelem) {
 	}
 	case MLF2_TYPE_Q4_K: dequant_q4_K(src, out, nelem); return 0;
 	case MLF2_TYPE_Q6_K: dequant_q6_K(src, out, nelem); return 0;
+	case MLF2_TYPE_Q8_0: dequant_q8_0(src, out, nelem); return 0;
 	default: return -1;
 	}
+}
+
+/* ── Q8_0 ──
+ * 32 int8 + one f16 scale per block: what ggml gives any tensor whose row is
+ * not a multiple of 256 (so every sub-1B model's attention), and what a
+ * "Q8_0" GGUF is made of throughout. */
+void dequant_q8_0(const void *blocks, float *out, int nelem) {
+	const block_q8_0 *b = (const block_q8_0 *)blocks;
+	for (int i = 0; i < nelem / 32; i++) {
+		float d = f16_to_f32(b[i].d);
+		for (int l = 0; l < 32; l++) out[i * 32 + l] = d * (float)b[i].qs[l];
+	}
+}
+
+/* Row · activation with both sides int8: acc += d_w · s_x · Σ q·x per block. */
+float q8_0_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs) {
+	const block_q8_0 *b = (const block_q8_0 *)w_row;
+	int nb = n_in / 32;
+#if defined(HAKM_AVX2) && defined(__FMA__)
+	/* maddubs is u8·s8: feed |x| as the unsigned side and w with x's sign
+	   moved onto it — the products are unchanged and stay in range. */
+	__m256 facc = _mm256_setzero_ps();
+	const __m256i ones16 = _mm256_set1_epi16(1);
+	for (int i = 0; i < nb; i++) {
+		__m256i w = _mm256_loadu_si256((const __m256i *)b[i].qs);
+		__m256i x = _mm256_loadu_si256((const __m256i *)(xq + (size_t)i * 32));
+		__m256i ax = _mm256_sign_epi8(x, x);
+		__m256i sw = _mm256_sign_epi8(w, x);
+		__m256i p  = _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sw), ones16);
+		float s = f16_to_f32(b[i].d) * xs[i];
+		facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(s), facc);
+	}
+	__m128 lo = _mm256_castps256_ps128(facc), hi = _mm256_extractf128_ps(facc, 1);
+	lo = _mm_add_ps(lo, hi);
+	lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+	lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+	return _mm_cvtss_f32(lo);
+#elif defined(__ARM_NEON)
+	float acc = 0.0f;
+	for (int i = 0; i < nb; i++) {
+		int8x16_t w0 = vld1q_s8(b[i].qs), w1 = vld1q_s8(b[i].qs + 16);
+		int8x16_t x0 = vld1q_s8(xq + (size_t)i * 32), x1 = vld1q_s8(xq + (size_t)i * 32 + 16);
+		int32x4_t s = vdupq_n_s32(0);
+#if defined(HAKM_NEON_DOTPROD)
+		s = vdotq_s32(s, w0, x0);
+		s = vdotq_s32(s, w1, x1);
+#else
+		int16x8_t p = vmull_s8(vget_low_s8(w0), vget_low_s8(x0));
+		p = vmlal_s8(p, vget_high_s8(w0), vget_high_s8(x0));
+		p = vmlal_s8(p, vget_low_s8(w1),  vget_low_s8(x1));
+		p = vmlal_s8(p, vget_high_s8(w1), vget_high_s8(x1));
+		s = vpadalq_s16(s, p);
+#endif
+		acc += f16_to_f32(b[i].d) * xs[i] * (float)vaddvq_s32(s);
+	}
+	return acc;
+#else
+	float acc = 0.0f;
+	for (int i = 0; i < nb; i++) {
+		const int8_t *xb = xq + (size_t)i * 32;
+		int s = 0;
+		for (int l = 0; l < 32; l++) s += (int)b[i].qs[l] * (int)xb[l];
+		acc += f16_to_f32(b[i].d) * xs[i] * (float)s;
+	}
+	return acc;
+#endif
 }

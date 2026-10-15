@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://mithraeums.github.io">
-    <img src="https://mithraeums.github.io/assets/banner-hako-dark.svg" alt="hako — a from-scratch C inference engine for the inner chamber" width="100%"/>
+    <img src="https://mithraeums.github.io/assets/banner-hako.png" alt="hako — a from-scratch C inference engine for the inner chamber" width="100%"/>
   </a>
 </p>
 
@@ -9,15 +9,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/engine-v0.0.3-b89656?style=flat-square&labelColor=14130f" alt="v0.0.3"/></a>
-  <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
-  <img src="https://img.shields.io/badge/deps-libc%20%2B%20libm%20%2B%20pthread-c8c2b2?style=flat-square&labelColor=14130f" alt="deps"/>
-  <img src="https://img.shields.io/badge/runtime-no%20llama.cpp%20%C2%B7%20no%20ollama-c8c2b2?style=flat-square&labelColor=14130f" alt="no llama.cpp / no ollama"/>
-  <img src="https://img.shields.io/badge/models-hako--sho%20%C2%B7%20hako--koi-c8c2b2?style=flat-square&labelColor=14130f" alt="models"/>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.4-e2402e?style=flat-square&labelColor=14130f" alt="v0.0.4"/></a>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
+  <img src="https://img.shields.io/badge/deps-libc%20%2B%20libm%20%2B%20pthread-2636c4?style=flat-square&labelColor=14130f" alt="deps"/>
+  <img src="https://img.shields.io/badge/runtime-no%20llama.cpp%20%C2%B7%20no%20ollama-2636c4?style=flat-square&labelColor=14130f" alt="no llama.cpp / no ollama"/>
+  <img src="https://img.shields.io/badge/models-hako--sho%20%C2%B7%20hako--koi-2636c4?style=flat-square&labelColor=14130f" alt="models"/>
 </p>
 
 <p align="center">
-  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako/releases">releases</a> &nbsp;·&nbsp; <a href="https://huggingface.co/mithraeum">models</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-code">hako-code</a> (agent) &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-edit">hako-edit</a> (editor) &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
+  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako/releases">releases</a> &nbsp;·&nbsp; <a href="https://huggingface.co/mithraeum">models</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-code">hako-code</a> (agent) &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-edit">hako-edit</a> (editor) &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-studio">hako-studio</a> (browser) &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
 </p>
 
 <br>
@@ -60,10 +60,10 @@
 ## Overview
 
 This repo is **the engine**. It runs the [hako models](https://huggingface.co/mithraeum)
-end to end and is spawned by [hako-code](https://github.com/mithraeums/hako-code)
-(the agent) and [hako-edit](https://github.com/mithraeums/hako-edit) (the editor)
-as a `hakm` subprocess — one-shot `--chat-stdin` per turn, or a long-lived
-`--serve` process that keeps the model resident and reuses the KV cache.
+end to end. [hako-code](https://github.com/mithraeums/hako-code) (the agent) runs
+it as a `hakm` subprocess — a long-lived `--serve` process that keeps the model
+resident and reuses the KV cache — and [hako-edit](https://github.com/mithraeums/hako-edit)
+(the editor) reaches it through the agent. You can also run it directly.
 
 - **No ggml, no llama.cpp, no torch, no ollama.** The loader, the k-quant +
   int8 kernels, the BPE tokenizer, and the Qwen2 forward pass are all
@@ -85,9 +85,11 @@ as a `hakm` subprocess — one-shot `--chat-stdin` per turn, or a long-lived
 ## Build & Run
 
 ```sh
+curl -fsSL https://mithraeums.github.io/hakm.sh | sh    # release binary, or a source build where there is none (iSh)
+
 git clone https://github.com/mithraeums/hako && cd hako
 make                            # builds ./hakm — libc + libm + pthread, no deps
-make UNIVERSAL=1                # (cross) override ARCH for a fat / portable build
+make test                       # the ASan gates (no weights needed)
 ```
 
 > Deps: libc + libm + pthread. No third-party libraries. Built `-march=native` by
@@ -100,8 +102,9 @@ Weights are **never** stored here — pull them from HuggingFace
 ([huggingface.co/mithraeum](https://huggingface.co/mithraeum)) or convert your own:
 
 ```sh
-# let the agent fetch + convert for you:
-hako   →   :pull hako-sho
+hakm pull hako-sho      # resumable, checked, installed to ~/.hako/models/
+hakm list               # what is installed
+# (inside the agent: :pull hako-sho does the same)
 
 # or convert a Qwen2.5-Coder GGUF yourself, once:
 python3 tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho/hako-sho.mlf2
@@ -118,18 +121,19 @@ version; the first real fine-tune of a tier earns `v0.0.1`.
 ### Run
 
 ```sh
-M=~/.hako/models/hako-sho/hako-sho.mlf2
+M=hako-sho                                            # an id, org/id, or a .mlf2 path
 
 ./hakm "$M" --info                                   # arch banner, then exit
 ./hakm "$M" --raw -t 0 "def fibonacci(n):"           # raw greedy completion
 ./hakm "$M" --sys "You are hako." "ring buffers in C" # one ChatML turn
 ./hakm "$M" --sys "You are hako."                    # interactive multi-turn REPL
-./hakm --version                                     # hakm v0.0.3
+./hakm --version
 ```
 
 Flags: `-n` new-tokens · `-t` temp (0 = greedy) · `-p` top_p · `-k` top_k ·
 `--rep F` repetition penalty (1 = off) · `--rep-window N` (default 64) ·
-`-s` seed · `--sys TEXT` · `--ctx N` · `--raw` · `--info` · `--chat-stdin` · `--serve`.
+`-s` seed · `--sys TEXT` · `--ctx N` · `--raw` · `--info` · `--chat-stdin` · `--serve` ·
+`--no-kv-cache`. `hakm --help` lists them, plus the environment knobs.
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
 
@@ -173,10 +177,12 @@ ChatML, multi-turn REPL, `--serve`):
 
 Quant correctness gate: C output **bit-exact** vs `tests/q_ref.py` (Q4_K + Q6_K,
 maxdiff 0.0). Strict-FP build is batch-vs-single bit-identical. ASan + UBSan clean
-on chat + serve paths. Build `tests`:
+on chat + serve paths.
 
 ```sh
-make test_quant && ./test_quant      # Q4_K/Q6_K dequant vs reference
+make test                          # attention bounds, KV cache, Q8_0, damaged model files (ASan)
+make test_quant                    # build/test_quant: dequant a real tensor for tests/q_ref.py
+make test_kdot                     # build/test_kdot: fused Q4_K dot vs scalar, on real weights
 ```
 
 <p align="center"><sub><b>—— V ——</b></sub></p>
@@ -210,47 +216,42 @@ across batch columns) — not more threads.
 
 ## Change Log
 
-### engine v0.0.3 (Latest)
+### Latest — engine v0.0.4
 
-- **Prefill min-term hoist** — the q4k `dmin·m·Σx` term is activation-only, so
-  `scale·Σx` is precomputed once per activation and reused across every weight
-  row/thread. Frees half the per-group port-0 MACs → **~1.3× prefill** on the
-  i3, greedy output bit-identical (validated by `make test_kdot`).
-- **Repetition penalty** — `--rep F` / `--rep-window N` (and API `rep_penalty`);
-  **default off** to keep greedy tool-call turns deterministic.
-- **OOM hardening** — `hakm_ctx_new` guards the per-layer + scratch allocations
-  and fails to a clean error instead of segfaulting under RAM pressure.
-- **`--version` / `-v`** → `hakm v0.0.3`.
+- **Local answers stream** — `--serve` sends each token as it is sampled
+  (`T <len>` frames; opt-in via a 4th header field, so old callers and old
+  engines are unaffected). The agent types a local reply out in real time.
+- **KV prefix on disk** — the prefilled system prompt is saved under
+  `~/.hako/cache/kv/` and restored on the next run: cold first turn on the i3
+  went from **255 s to 2.3 s**. Keyed on model size+mtime, layers, kv dim, kv
+  type and the exact token ids; `--no-kv-cache` opts out.
+- **…and the cache is bounded** — one file per distinct system prompt, and
+  nothing ever deleted them (359 MB piled up before anyone looked). Oldest
+  first to `HAKM_KV_DIR_MAX_MB` (default 1024; `0` disables), the just-written
+  entry exempt.
+- **Small models no longer overflow** — `att_heads` indexed its scores by
+  position but two call sites passed a buffer sized by `ffn_dim`; safe for
+  sho/koi, a heap overflow for anything smaller. `make test_attn` reproduces
+  it under ASan if undone.
+- **32-bit / iSh** — builds on musl (`-D_DEFAULT_SOURCE`, `posix_madvise`); no
+  `-march=native` on i386, where the emulator advertises AVX/FMA it cannot run
+  (that was SIGILL mid-prefill); prefault off; a model larger than the address
+  space is refused with a message instead of a SIGBUS.
+- **Model store** — `hakm list | pull | rm`, resumable pulls, atomic install;
+  **llama arch** (SmolLM2 proven) and **Q8_0** (`make test_q8`).
+- **Damaged files are refused** — a truncated download or a corrupt tokenizer
+  gets a message (`model file is incomplete … run hakm pull again`) instead of a
+  segfault; `make test` builds damaged files and checks each one.
 
-### engine v0.0.2
-
-- **`--serve`** — resident framed-request loop with **KV prefix reuse**; warm
-  agent turns in seconds instead of re-prefilling every turn.
-- **Batched prefill** — `matmul_batch` + `hakm_forward_batch` (causal within
-  batch, lm_head only for the last token). `HAKM_BATCH` knob.
-- **Q6_K int8 dot path** — decode 2.88 → 8.40 tok/s; was riding the float
-  dequant path and dominating decode.
-- **Threaded attention + f16 KV cache** — decode flat with depth; koi KV at ctx
-  4096 halved.
-- **FMA q4k kernel** — one hsum per row; prefill + decode both up.
-- **Per-request temperature + stop sequences** in `--serve` (greedy tool turns,
-  break on `</tool_call>` / `</write_file>`).
-- **Honest tok/s** — every one-shot path now prints prefill and decode rates
-  **separately** (the blended figure hid a slow decode behind a fast prefill).
-- **`--version` / `-v`** → `hakm v0.0.2`.
-
-### engine v0.0.1
-
-- First native runner: MLF2 loader, Q4_K/Q6_K dequant, Qwen2 GQA forward,
-  NeoX rope, byte-level BPE, int8-activation × int4-weight fast dot, pthread
-  matmul. Runs 3B + 7B end to end, no llama.cpp / no ollama.
+Earlier versions, and the full detail: [CHANGELOG.md](CHANGELOG.md).
 
 <p align="center"><sub><b>—— VII ——</b></sub></p>
 
 ## Known gaps / next
 
 - **Windows:** the loader uses POSIX `mmap`; MinGW lacks `sys/mman.h`. An
-  `#ifdef _WIN32` mmap shim is the unlock. Linux / macOS / FreeBSD build today.
+  `#ifdef _WIN32` mmap shim is the unlock. Linux (glibc and musl, 64- and
+  32-bit), macOS and FreeBSD build today.
 - **Tokenizer pretokenizer is simplified** (whitespace-delimited; merges,
   symbols, special tokens correct). Needs the full Qwen2 regex for
   digit/punctuation-run boundaries to exactly match reference tokenization.
@@ -268,6 +269,9 @@ across batch columns) — not more threads.
 - [x] `--serve` resident loop + KV prefix reuse
 - [x] batched prefill, Q6_K int8 path, threaded attention, f16 KV
 - [x] runs 3B (`hako-sho`) + 7B (`hako-koi`) end to end
+- [x] token streaming in `--serve`; the prefilled system prompt kept on disk, bounded by eviction
+- [x] `hakm list | pull | rm`; llama-architecture models; Q8_0
+- [x] builds and tests on glibc, musl and 32-bit i386 (the iSh userland)
 - [ ] Windows `mmap` shim
 - [ ] full Qwen2 pretokenizer regex
 - [ ] NEON q6k path (arm64) + prefill GEMM micro-kernel
@@ -278,15 +282,20 @@ across batch columns) — not more threads.
 ## Source layout
 
 ```
-src/loader.c     mmap MLF2, resolve tensors
-src/quant.c      Q4_K / Q6_K dequant + int8 fast dot (bit-exact)
-src/nn.c         rmsnorm, softmax, SiLU, NeoX rope, matmul, worker pool
-src/model.c      Qwen2 forward — GQA, KV cache, batched prefill, threaded attn
-src/bpe.c        Qwen2 byte-level BPE (encode + decode)
-src/sample.c     temp / top-k / top-p / greedy
-cli/main.c       the hakm CLI — one-shot / raw / REPL / --chat-stdin / --serve
+src/loader.c       mmap MLF2, resolve tensors, refuse damaged files
+src/quant.c        Q4_K / Q6_K / Q8_0 dequant + int8 fast dot (bit-exact)
+src/nn.c           rmsnorm, softmax, SiLU, rope, matmul, worker pool
+src/model.c        Qwen2 / llama forward — GQA, KV cache, batched prefill, threaded attn
+src/bpe.c          byte-level BPE (encode + decode)
+src/sample.c       temp / top-k / top-p / greedy, repetition penalty
+src/kvcache.c      the system-prompt KV prefix on disk, with eviction
+src/models.c       hakm list / pull / rm — the model store
+src/hakm_api.c     optional in-process library (libhakm.a); not the agent's path
+cli/main.c         the hakm CLI — one-shot / raw / REPL / --chat-stdin / --serve
+include/mlf2.h     the native container format
 tools/gguf2mlf.py  offline GGUF → MLF2 converter (pure stdlib)
-include/mlf2.h   the native container format
+tests/             make test (ASan) + the real-weights checks and q_ref.py
+install.sh         the installer behind mithraeums.github.io/hakm.sh
 ```
 
 ## Contributing

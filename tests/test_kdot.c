@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * test_kdot.c — validate the fused Q4_K int8 dot (q4k_vec_dot) against a
  * dead-simple scalar reference computing the same formula inline. Exercises the

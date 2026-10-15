@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* bpe.h — Qwen2 byte-level BPE tokenizer, loaded from the MLF2 tok blob. */
 #pragma once
 #include "loader.h"

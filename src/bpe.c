@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * bpe.c — Qwen2 byte-level BPE.
  *
@@ -9,6 +10,7 @@
 #include "../include/mlf2.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -82,19 +84,28 @@ static int utf8_get(const char *p, int *adv) {
 }
 
 hakm_tok *tok_new(const hakm_model *m) {
-	hakm_tok *t = calloc(1, sizeof(*t));
+	/* Every length comes from the file: bound each read by the end of the
+	   mapping, so a corrupt or truncated tokenizer fails instead of walking off. */
 	const unsigned char *p = m->tok;
+	const unsigned char *end = (const unsigned char *)m->map + m->map_size;
+	if (!p || p + 8 > end) goto corrupt0;
+	hakm_tok *t = calloc(1, sizeof(*t));
+	if (!t) return NULL;
 	memcpy(&t->n_tokens, p, 4);
 	memcpy(&t->n_merges, p + 4, 4);
 	p += 8;
+	if (t->n_tokens <= 0 || t->n_merges < 0 || t->n_tokens > (1 << 24) || t->n_merges > (1 << 24)) goto corrupt;
 
 	t->tok_ptr = malloc((size_t)t->n_tokens * sizeof(char *));
 	t->tok_len = malloc((size_t)t->n_tokens * sizeof(int));
+	if (!t->tok_ptr || !t->tok_len) goto corrupt;
 	hm_init(&t->vocab, t->n_tokens * 2);
 	for (int i = 0; i < t->n_tokens; i++) {
 		/* record: u8 type, u32 len, bytes */
+		if (end - p < 5) goto corrupt;
 		p += 1;                               /* type (unused for now) */
 		int len; memcpy(&len, p, 4); p += 4;
+		if (len < 0 || end - p < len) goto corrupt;
 		t->tok_ptr[i] = (const char *)p;
 		t->tok_len[i] = len;
 		hm_put(&t->vocab, (const char *)p, len, i);
@@ -102,13 +113,20 @@ hakm_tok *tok_new(const hakm_model *m) {
 	}
 	hm_init(&t->merge, t->n_merges * 2);
 	for (int i = 0; i < t->n_merges; i++) {
+		if (end - p < 4) goto corrupt;
 		int len; memcpy(&len, p, 4); p += 4;
+		if (len < 0 || end - p < len) goto corrupt;
 		hm_put(&t->merge, (const char *)p, len, i);   /* rank = i */
 		p += len;
 	}
 	build_byte_maps(t);
 	t->eos = (int)m->h.eos_id;
 	return t;
+corrupt:
+	tok_free(t);
+corrupt0:
+	fprintf(stderr, "hakm: corrupt tokenizer in the model file\n");
+	return NULL;
 }
 
 void tok_free(hakm_tok *t) {

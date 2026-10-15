@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /*
  * mlf2.h — on-disk format for the hakm engine (MLF v2).
  *
@@ -34,9 +35,13 @@ extern "C" {
 #define MLF2_ALIGN     32u
 #define MLF2_MAX_NAME  48u   /* tensor names fit Qwen ("blk.35.ffn_down.weight") */
 
-/* Architecture id. Only qwen2 for now; reserve the enum for koi/samurai. */
+/* Architecture id. The forward pass is one shape (RMSNorm → GQA attention →
+ * RoPE → SwiGLU); what differs per arch is RoPE pairing and optional bias:
+ *   qwen2  neox rope (i, i+d/2), q/k/v bias
+ *   llama  norm rope (2i, 2i+1), no bias — also mistral, smollm, tinyllama */
 enum mlf2_arch {
 	MLF2_ARCH_QWEN2 = 0,
+	MLF2_ARCH_LLAMA = 1,
 };
 
 /* Tensor element types — values MUST match ggml_type so the converter copies
@@ -44,6 +49,7 @@ enum mlf2_arch {
 enum mlf2_type {
 	MLF2_TYPE_F32  = 0,
 	MLF2_TYPE_F16  = 1,
+	MLF2_TYPE_Q8_0 = 8,
 	MLF2_TYPE_Q4_K = 12,
 	MLF2_TYPE_Q6_K = 14,
 };

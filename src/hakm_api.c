@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* hakm_api.c — in-process inference API. See hakm_api.h.
  *
  * Wraps the resident engine (model + tokenizer) behind a stateless chat call so

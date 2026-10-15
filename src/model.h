@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* model.h — Qwen2 forward pass with KV cache, over MLF2 weights. */
 #pragma once
 #include "loader.h"
@@ -38,6 +39,10 @@ typedef struct hakm_ctx {
 	/* batch-prefill scratch: B-row versions of the above, lazily sized by
 	 * hakm_forward_batch (batch_cap rows). NULL until first batched call. */
 	float *bxb, *bxn, *bq, *bk, *bv, *batt, *bgate, *bup;
+	/* Attention scores are indexed by POSITION (0..pos), so this is sized by
+	   max_seq — not by ffn_dim like the gate/up buffers beside it. Sharing
+	   bgate here overflowed the heap on any model whose ffn_dim < ctx. */
+	float *bscores;
 	int    batch_cap;
 
 	/* per-thread attention score rows for threaded decode attention
