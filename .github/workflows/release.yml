@@ -18,12 +18,15 @@ permissions:
   contents: write
 
 # ── ARCH portability ──
-# The engine's AVX2 dot path is COMPILE-gated by -march (#elif __AVX2__), so the
-# shipped baseline trades the ~10% AVX2 win for running on any CPU. The bigger
-# ~2.1x int8 win is plain integer math (-O3 auto-vectorizes within the target),
-# kept at every baseline. To require Haswell+ (2013) and get AVX2, bump the linux
-# baseline to `-march=x86-64-v3`. -march=native is NEVER used in CI (would SIGILL
-# on older user CPUs). Users building locally still get -march=native by default.
+# The engine's SIMD paths are COMPILE-gated (__AVX2__, __FMA__), and on x86 they
+# are most of the speed: on an i3-8100 a v2 build decodes sho at 2.7 tok/s and a
+# v3 build at 8.3-9.5 (prefill 4x). So x86 ships both:
+#   linux: hakm-linux-x86_64 (v2, any CPU) + hakm-linux-x86_64-v3 (Haswell+, 2013);
+#          install.sh picks v3 when /proc/cpuinfo has the v3 flags
+#   macOS: one universal binary with an x86_64h slice, which macOS itself picks on
+#          a Haswell+ Intel Mac (arm64 already gets dotprod: Apple's default is M1)
+# -march=native is NEVER used in CI (would SIGILL on older user CPUs). Users
+# building locally still get -march=native by default.
 jobs:
   build:
     name: build (${{ matrix.name }})
@@ -39,6 +42,13 @@ jobs:
             staging: hakm-linux-x86_64
             sha: hakm-linux-x86_64.sha256
 
+          - name: linux-x86_64-v3
+            os: ubuntu-latest
+            arch: "-march=x86-64-v3"
+            artifact: hakm-linux-x86_64-v3.tar.gz
+            staging: hakm-linux-x86_64-v3
+            sha: hakm-linux-x86_64-v3.sha256
+
           - name: linux-arm64
             os: ubuntu-24.04-arm
             arch: "-march=armv8-a"
@@ -48,7 +58,7 @@ jobs:
 
           - name: macos-universal
             os: macos-latest
-            arch: "-arch arm64 -arch x86_64"
+            arch: "-arch arm64 -arch x86_64 -arch x86_64h"
             artifact: hakm-macos-universal.tar.gz
             staging: hakm-macos-universal
             sha: hakm-macos-universal.sha256

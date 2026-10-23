@@ -54,7 +54,13 @@ asset=""
 case "$uname_s" in
 	Linux*)
 		case "$uname_m" in
-			x86_64|amd64)  asset="hakm-linux-x86_64.tar.gz"; dirname="hakm-linux-x86_64" ;;
+			x86_64|amd64)  asset="hakm-linux-x86_64.tar.gz"; dirname="hakm-linux-x86_64"
+			               # AVX2/FMA and the rest of x86-64-v3: the build that is ~3x faster
+			               flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+			               fast=hakm-linux-x86_64-v3
+			               for f in avx2 fma bmi2 f16c movbe; do
+			               	case " ${flags} " in *" $f "*) ;; *) fast="" ;; esac
+			               done ;;
 			arm64|aarch64) asset="hakm-linux-arm64.tar.gz";  dirname="hakm-linux-arm64" ;;
 			i386|i486|i586|i686) asset="" ;;         # iSh, 32-bit: source
 			*) asset="" ;;
@@ -76,6 +82,11 @@ else
 		build_from_source
 	else
 		echo "latest: $tag"
+		# the faster build when this CPU runs it and the release has one (v0.0.5 on)
+		if [ -n "${fast:-}" ] && curl -fsIL -o /dev/null "https://github.com/${REPO}/releases/download/${tag}/${fast}.tar.gz" 2>/dev/null; then
+			asset="${fast}.tar.gz"; dirname="$fast"
+			echo "this CPU has AVX2 and FMA: the faster x86-64-v3 build"
+		fi
 		url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
 		sha_name="${asset%.tar.gz}.sha256"
 		sha_url="https://github.com/${REPO}/releases/download/${tag}/${sha_name}"
