@@ -247,35 +247,12 @@ Earlier versions, and the full detail: [CHANGELOG.md](CHANGELOG.md).
 
 <p align="center"><sub><b>—— VII ——</b></sub></p>
 
-## Known gaps / next
+## Known gaps
 
-- **Windows:** the loader uses POSIX `mmap`; MinGW lacks `sys/mman.h`. An
-  `#ifdef _WIN32` mmap shim is the unlock. Linux (glibc and musl, 64- and
+- **Windows:** the loader uses POSIX `mmap`, which MinGW lacks. Linux (glibc and musl, 64- and
   32-bit), macOS and FreeBSD build today.
-- **Tokenizer pretokenizer is simplified** (whitespace-delimited; merges,
-  symbols, special tokens correct). Needs the full Qwen2 regex for
-  digit/punctuation-run boundaries to exactly match reference tokenization.
-- **Decode ceiling:** near the i3's bandwidth/compute floor. Real breaks =
-  speculative decode (sho as a draft model for koi — needs the training lane) or
-  a smaller quant tier.
-- **Prefill:** a q4k/q6k GEMM micro-kernel (hoist nibble-unpack across the batch)
-  is the next pure-engine lever; NEON q6k path for arm64.
-
-## Roadmap
-
-- [x] MLF2 loader + own k-quant dequant (bit-exact)
-- [x] Qwen2 GQA forward, NeoX rope, byte-level BPE
-- [x] int8-activation × int4-weight fast dot (AVX2-FMA + scalar)
-- [x] `--serve` resident loop + KV prefix reuse
-- [x] batched prefill, Q6_K int8 path, threaded attention, f16 KV
-- [x] runs 3B (`hako-sho`) + 7B (`hako-koi`) end to end
-- [x] token streaming in `--serve`; the prefilled system prompt kept on disk, bounded by eviction
-- [x] `hakm list | pull | rm`; llama-architecture models; Q8_0
-- [x] builds and tests on glibc, musl and 32-bit i386 (the iSh userland)
-- [ ] Windows `mmap` shim
-- [ ] full Qwen2 pretokenizer regex
-- [ ] NEON q6k path (arm64) + prefill GEMM micro-kernel
-- [ ] speculative decode (draft model from the training lane)
+- **Tokenizer pretokenizer is simplified** (whitespace-delimited; merges, symbols and special
+  tokens are correct), so digit and punctuation runs can split differently from the reference.
 
 <p align="center"><sub><b>—— VIII ——</b></sub></p>
 
