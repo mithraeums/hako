@@ -61,8 +61,7 @@ void hakm_session_close(hakm_session *s)
 
 const char *hakm_session_arch(const hakm_session *s)
 {
-	(void)s;
-	return "qwen2";   /* only arch the engine implements today */
+	return mlf2_arch_name(s->ctx->model.h.arch);
 }
 
 int hakm_session_ctxlen(const hakm_session *s)

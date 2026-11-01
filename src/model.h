@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
-/* model.h — Qwen2 forward pass with KV cache, over MLF2 weights. */
+/* model.h — forward pass with KV cache, over MLF2 weights. */
 #pragma once
 #include "loader.h"
 #include <stdint.h>
@@ -18,6 +18,7 @@ typedef struct {
 	const mlf2_tensor *attn_norm, *ffn_norm;
 	const mlf2_tensor *wq, *wk, *wv, *wo;
 	const mlf2_tensor *bq, *bk, *bv;          /* biases (F32) or NULL */
+	const mlf2_tensor *q_norm, *k_norm;       /* per-head RMSNorm weights [head_dim] or NULL */
 	const mlf2_tensor *gate, *up, *down;
 } layer_t;
 
@@ -27,8 +28,9 @@ typedef struct hakm_ctx {
 	const mlf2_tensor *tok_embd, *out_norm;
 	const mlf2_tensor *out_weight;            /* lm_head: == tok_embd if TIED_EMBED, else output.weight (7B+) */
 
-	int d_model, n_heads, n_kv_heads, head_dim, kv_dim, ffn_dim, n_layers, vocab;
+	int d_model, n_heads, n_kv_heads, head_dim, q_dim, kv_dim, ffn_dim, n_layers, vocab;
 	float rope_theta, rms_eps;
+	int rope_norm;              /* rope pairs (2i, 2i+1), else neox */
 
 	int max_seq, pos;            /* KV cache capacity + next write position */
 	hakm_kv_t *k_cache, *v_cache; /* [n_layers * max_seq * kv_dim] each */
@@ -66,4 +68,9 @@ const float *hakm_forward(hakm_ctx *c, int token);
 const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n);
 
 /* Reset position to 0 (new sequence). */
+/* Run n tokens as one batch and return the summed negative log-likelihood of
+ * toks[i+1] given toks[0..i], for i from `from` to n-2 (natural log). The
+ * scoring half of perplexity; -1 on failure. Advances the position like a
+ * forward pass. */
+double hakm_score_batch(hakm_ctx *c, const int *toks, int n, int from);
 void hakm_reset(hakm_ctx *c);

@@ -43,7 +43,9 @@
 #include "../src/models.h"
 #include "../src/bpe.h"
 #include "../src/sample.h"
+#include "../src/quant.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +81,42 @@ static int push_text(const hakm_tok *tk, const char *s, int *buf, int *n, int ma
 static int push_id(int id, int *buf, int *n, int max) {
 	if (id < 0 || *n >= max) return -1;
 	buf[(*n)++] = id;
+	return 0;
+}
+
+/* Perplexity over a text file: windows of `win` tokens, each scored on its
+ * second half so every scored token has at least win/2 of context (the usual
+ * convention, so numbers compare with other tools at the same window). The
+ * point is comparing files of ONE model (bf16 vs q8_0 vs q4_k): the tokenizer's
+ * simplified pretokenizer is the same for all of them. */
+static int run_ppl(hakm_ctx *c, const hakm_tok *tk, const char *file, int win, int chunks) {
+	FILE *f = fopen(file, "rb");
+	if (!f) { fprintf(stderr, "hakm: cannot read %s\n", file); return 1; }
+	fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+	char *text = malloc((size_t)sz + 1);
+	int *toks = malloc(((size_t)sz + 16) * sizeof(int));
+	if (!text || !toks || fread(text, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(text); free(toks); return 1; }
+	fclose(f); text[sz] = 0;
+	int n = tok_encode(tk, text, toks, (int)sz + 16);
+	free(text);
+	int have = n / win;
+	if (chunks <= 0 || chunks > have) chunks = have;
+	if (chunks < 1) { fprintf(stderr, "hakm: %s is %d tokens, shorter than one %d-token window\n", file, n, win); free(toks); return 1; }
+	double nll = 0, t0 = wall();
+	long scored = 0, bytes = 0;
+	for (int k = 0; k < chunks; k++) {
+		hakm_reset(c);
+		double s = hakm_score_batch(c, toks + (size_t)k * win, win, win / 2 - 1);
+		if (s < 0) { fprintf(stderr, "hakm: scoring failed\n"); free(toks); return 1; }
+		nll += s; scored += win - win / 2;
+		char b[256];   /* the bytes scored: bits per byte compares models with different tokenizers */
+		for (int i = win / 2; i < win; i++) bytes += tok_decode_id(tk, toks[(size_t)k * win + i], b, sizeof b);
+		fprintf(stderr, "\r  chunk %d/%d  ppl %.4f  (%.0f tok/s)", k + 1, chunks, exp(nll / scored), (double)(k + 1) * win / (wall() - t0));
+	}
+	fprintf(stderr, "\n");
+	printf("ppl %.4f over %ld tokens (%d windows of %d), %.4f bits per byte\n",
+	       exp(nll / scored), scored, chunks, win, nll / log(2.0) / (double)bytes);
+	free(toks);
 	return 0;
 }
 
@@ -139,6 +177,11 @@ static void run_oneshot(hakm_ctx *c, hakm_tok *tk, sampler *sp,
 	        gen, dt, dt > 0 ? gen / dt : 0.0);
 }
 
+/* Text after the open assistant header. A model whose vocab has <think> (qwen3)
+ * reasons before answering unless the block is given to it already empty; that
+ * is its own template's non-thinking mode. --think leaves it to the model. */
+static int g_think_open = -1, g_think_close = -1;
+
 /* Build a ChatML turn into buf: [im_start]role\n{text}[im_end]\n , optionally
  * leaving the assistant header open for generation. */
 static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
@@ -148,6 +191,9 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 	if (push_text(tk, role, buf, n, max)) return -1;
 	if (push_text(tk, "\n", buf, n, max)) return -1;
 	if (text && push_text(tk, text, buf, n, max)) return -1;
+	if (open && g_think_open >= 0 &&
+	    (push_id(g_think_open, buf, n, max) || push_text(tk, "\n\n", buf, n, max) ||
+	     push_id(g_think_close, buf, n, max) || push_text(tk, "\n\n", buf, n, max))) return -1;
 	if (!open) {
 		if (push_id(im_end, buf, n, max)) return -1;
 		if (push_text(tk, "\n", buf, n, max)) return -1;
@@ -156,7 +202,7 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 }
 
 #ifndef HAKM_VERSION
-#define HAKM_VERSION "0.0.4"
+#define HAKM_VERSION "0.0.5"
 #endif
 
 int main(int argc, char **argv) {
@@ -172,15 +218,23 @@ int main(int argc, char **argv) {
 			"  hakm list                 models in ~/.hako/models\n"
 			"  hakm pull <id>            download one (hako-sho, hako-koi)\n"
 			"  hakm rm <id>              remove one\n"
+			"  hakm quantize <model> <out> <type>   rewrite at q4_k (the q4_k_m mix), q6_k, q8_0, f16 or f32\n"
 			"  hakm <model> [PROMPT]     one completion (model = id, org/id or a .mlf2 path)\n\n"
 			"options: -n N tokens  -t F temperature  -p F top-p  -k N top-k  -s N seed\n"
 			"         --rep F --rep-window N   repetition penalty\n"
-			"         --sys TEXT  --raw  --info  --chat-stdin  --serve  --no-kv-cache\n"
+			"         --sys TEXT  --raw  --think  --info  --chat-stdin  --serve  --no-kv-cache\n"
+			"         --ppl FILE [--chunks N] [--ctx N]   perplexity (windows of 512 unless --ctx)\n"
 			"env:     HAKM_THREADS  HAKM_KV_DIR_MAX_MB (cache budget, 0 = unbounded)  HAKM_PREFAULT=0|1\n",
 			HAKM_VERSION);
 		return argc < 2 ? 1 : 0;
 	}
 	if (argc >= 2 && !strcmp(argv[1], "list")) return hakm_list() >= 0 ? 0 : 1;
+	if (argc >= 2 && !strcmp(argv[1], "quantize")) {
+		if (argc != 5) { fprintf(stderr, "usage: %s quantize <model> <out.mlf2> q4_k|q6_k|q8_0|f16|f32\n", argv[0]); return 1; }
+		char in[4096];
+		if (hakm_resolve(argv[2], in, sizeof in) != 0) { fprintf(stderr, "hakm: bad model id '%s'\n", argv[2]); return 1; }
+		return hakm_quantize(in, argv[3], argv[4]) == 0 ? 0 : 1;
+	}
 	if (argc >= 2 && (!strcmp(argv[1], "pull") || !strcmp(argv[1], "rm"))) {
 		if (argc < 3) { fprintf(stderr, "usage: %s %s <id>\n", argv[0], argv[1]); return 1; }
 		int rc = 0;
@@ -192,8 +246,9 @@ int main(int argc, char **argv) {
 	if (hakm_resolve(argv[1], resolved, sizeof(resolved)) != 0) {
 		fprintf(stderr, "hakm: bad model id '%s'\n", argv[1]); return 1;
 	}
-	const char *path = resolved, *sys = NULL;
-	int n_new = 128, top_k = 40, info = 0, raw = 0, chat_stdin = 0, serve = 0, dbg = 0;
+	const char *path = resolved, *sys = NULL, *ppl = NULL;
+	int ctx_set = 0, chunks = 8;
+	int n_new = 128, top_k = 40, info = 0, raw = 0, chat_stdin = 0, serve = 0, dbg = 0, think = 0;
 	int max_seq = 2048;
 	float temp = 0.7f, top_p = 0.9f, rep = 1.0f;
 	int rep_win = 64;
@@ -209,8 +264,11 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--rep-window") && i + 1 < argc) rep_win = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-s") && i + 1 < argc) seed  = strtoull(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "--sys") && i + 1 < argc) sys = argv[++i];
-		else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) max_seq = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) { max_seq = atoi(argv[++i]); ctx_set = 1; }
+		else if (!strcmp(argv[i], "--ppl") && i + 1 < argc) ppl = argv[++i];
+		else if (!strcmp(argv[i], "--chunks") && i + 1 < argc) chunks = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--raw"))  raw = 1;
+		else if (!strcmp(argv[i], "--think")) think = 1;
 		else if (!strcmp(argv[i], "--chat-stdin")) chat_stdin = 1;
 		else if (!strcmp(argv[i], "--serve")) serve = 1;
 		else if (!strcmp(argv[i], "--info")) info = 1;
@@ -220,6 +278,7 @@ int main(int argc, char **argv) {
 		       strncat(prompt, argv[i], sizeof(prompt) - strlen(prompt) - 1); }
 	}
 
+	if (ppl && !ctx_set) max_seq = 512;
 	if (max_seq <= 0) max_seq = 2048;
 	double t_start = wall();
 	hakm_ctx *c = hakm_ctx_new(path, max_seq);
@@ -241,9 +300,10 @@ int main(int argc, char **argv) {
 	}
 
 	fprintf(stderr,
-	        "hakm: hako engine · arch %s · %.2fB params · %d layers · "
+	        "hakm: hako engine · arch %s · %.2f%s params · %d layers · "
 	        "d_model %d · heads %d/%d (GQA) · ffn %d · vocab %d · ctx %d · rope_theta %.0f\n",
-	        c->model.h.arch == MLF2_ARCH_LLAMA ? "llama" : "qwen2", params / 1e9, c->n_layers, c->d_model, c->n_heads, c->n_kv_heads,
+	        mlf2_arch_name(c->model.h.arch), params >= 1e9 ? params / 1e9 : params / 1e6,
+	        params >= 1e9 ? "B" : "M", c->n_layers, c->d_model, c->n_heads, c->n_kv_heads,
 	        c->ffn_dim, c->vocab, max_seq, (double)c->rope_theta);
 	if (info) { hakm_ctx_free(c); return 0; }
 
@@ -258,7 +318,12 @@ int main(int argc, char **argv) {
 	sampler_set_rep(&sp, rep, rep_win);
 	int im_start = tok_id(tk, "<|im_start|>");
 	int im_end   = tok_id(tk, "<|im_end|>");
+	if (!think && tok_id(tk, "<think>") >= 0 && tok_id(tk, "</think>") >= 0) {
+		g_think_open = tok_id(tk, "<think>"); g_think_close = tok_id(tk, "</think>");
+	}
 	int chat_ok  = (im_start >= 0 && im_end >= 0);
+
+	if (ppl) { int rc = run_ppl(c, tk, ppl, max_seq, chunks); tok_free(tk); hakm_ctx_free(c); return rc; }
 
 	int *buf = malloc(max_seq * sizeof(int));
 

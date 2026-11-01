@@ -9,7 +9,7 @@ dequant math. See ../include/mlf2.h for the on-disk format.
 Usage:
     python3 gguf2mlf.py <model.gguf> <out.mlf2>
 
-Supported arch: qwen2, llama (GPT-2 BPE tokenizer only).  Supported tensor types: F32, F16, Q8_0, Q4_K, Q6_K
+Supported arch: qwen2, llama, qwen3 (GPT-2 BPE tokenizer only).  Supported tensor types: F32, F16, Q8_0, Q4_K, Q6_K
 (the exact set Qwen2.5-Coder Q4_K_M ships).
 """
 import struct, sys, os
@@ -85,7 +85,7 @@ def main():
     md, tensors, data_start, g = load_gguf(src)
 
     arch = md["general.architecture"].decode()
-    ARCHES = {"qwen2": 0, "llama": 1}
+    ARCHES = {"qwen2": 0, "llama": 1, "qwen3": 2}
     if arch not in ARCHES:
         raise SystemExit(f"unsupported arch {arch!r} (one of {sorted(ARCHES)})")
     tokmodel = md.get("tokenizer.ggml.model", b"gpt2").decode()
@@ -102,12 +102,15 @@ def main():
     ffn_dim    = m("feed_forward_length")
     ctx        = m("context_length")
     rms_eps    = m("attention.layer_norm_rms_epsilon")
-    rope_theta = md.get(f"{arch}.rope.freq_base", 1000000.0 if arch == "qwen2" else 10000.0)
-    head_dim   = d_model // n_heads
+    rope_theta = md.get(f"{arch}.rope.freq_base", 10000.0 if arch == "llama" else 1000000.0)
+    head_dim   = md.get(f"{arch}.attention.key_length", d_model // n_heads)
+    if md.get(f"{arch}.attention.value_length", head_dim) != head_dim:
+        raise SystemExit("key_length != value_length: the engine assumes one head_dim for k and v")
 
     names = {t["name"] for t in tensors}
     tied  = "output.weight" not in names
     has_bias = "blk.0.attn_q.bias" in names
+    qk_norm  = "blk.0.attn_q_norm.weight" in names
     vocab  = len(md["tokenizer.ggml.tokens"])
     bos = md.get("tokenizer.ggml.bos_token_id", 0)
     eos = md.get("tokenizer.ggml.eos_token_id", 0)
@@ -115,10 +118,11 @@ def main():
     flags = 0
     if has_bias: flags |= 1
     if tied:     flags |= 2
+    if arch == "llama": flags |= 4   # ROPE_NORM: ggml's llama permutes q/k for (2i, 2i+1) pairs
 
     print(f"arch={arch} layers={n_layers} d_model={d_model} heads={n_heads} "
           f"kv_heads={n_kv_heads} head_dim={head_dim} ffn={ffn_dim} vocab={vocab}")
-    print(f"rope_theta={rope_theta} rms_eps={rms_eps} tied={tied} qkv_bias={has_bias}")
+    print(f"rope_theta={rope_theta} rms_eps={rms_eps} tied={tied} qkv_bias={has_bias} qk_norm={qk_norm}")
 
     # validate every tensor type is supported, compute nbytes
     for t in tensors:

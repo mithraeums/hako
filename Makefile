@@ -27,7 +27,7 @@ ARCH    ?= $(ARCH_DEFAULT)
 CFLAGS  ?= -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -ffast-math -pthread $(ARCH)
 LDLIBS  := -lm -lpthread
 
-SRC := src/loader.c src/quant.c src/nn.c src/model.c src/bpe.c src/sample.c src/kvcache.c src/models.c
+SRC := src/loader.c src/quant.c src/nn.c src/model.c src/bpe.c src/sample.c src/kvcache.c src/models.c src/quantize.c
 # embed API source: OPTIONAL in-process library. The hako-code agent does NOT use
 # this — it spawns the `hakm` CLI as a subprocess. Kept for third-party embedders.
 LIB := $(SRC) src/hakm_api.c
@@ -40,6 +40,13 @@ LIBA      := libhakm.a
 EMBED_OBJ := $(LIB:.c=.o)
 
 all: hakm
+
+# the trainer: its own binary, so hakm stays the size it is. No -ffast-math:
+# the loop checks the loss for NaN, and fast-math may assume there is none.
+TRAIN_SRC := src/train.c src/nn.c src/quant.c src/loader.c src/bpe.c
+train: hakm-train
+hakm-train: cli/train.c $(TRAIN_SRC) $(wildcard src/*.h include/*.h)
+	$(CC) -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -ffp-contract=fast -pthread $(ARCH) -o $@ cli/train.c $(TRAIN_SRC) $(LDLIBS)
 
 hakm: cli/main.c $(SRC)
 	@echo "hakm: ARCH=$(if $(ARCH),$(ARCH),none (portable baseline))"
@@ -56,7 +63,7 @@ $(LIBA): $(EMBED_OBJ)
 # Test binaries build into build/, out of the way of the source. `make test_attn`
 # and friends still work: each name is an alias for build/<name>.
 B := build
-TESTS := test_attn test_kvc test_q8 test_load test_quant test_kdot test_api
+TESTS := test_attn test_arch test_train test_quantize test_kvc test_q8 test_load test_quant test_kdot test_api
 TCFLAGS = -O1 -g -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -pthread $(SAN)
 
 $(B):
@@ -66,6 +73,20 @@ $(B):
 # ASan — that is what makes the bounds check real.
 $(B)/test_attn: tests/test_attn.c src/model.c src/loader.c src/quant.c src/nn.c $(wildcard src/*.h include/*.h) | $(B)
 	$(CC) $(TCFLAGS) -o $@ tests/test_attn.c src/loader.c src/quant.c src/nn.c -lm -lpthread
+
+# the forward pass vs a plain reference on a tiny model with q_dim != d_model
+# and per-head q/k norm (the Qwen3 shape). ASan, like test_attn.
+$(B)/test_arch: tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c $(wildcard src/*.h include/*.h) | $(B)
+	$(CC) $(TCFLAGS) -o $@ tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c -lm -lpthread
+
+# the trainer: gradients vs finite differences, the engine scoring its file,
+# the BPE through the engine's encoder, checkpoints. ASan.
+$(B)/test_train: tests/test_train.c $(TRAIN_SRC) src/model.c $(wildcard src/*.h include/*.h) | $(B)
+	$(CC) $(TCFLAGS) $(ARCH) -o $@ tests/test_train.c $(TRAIN_SRC) src/model.c -lm -lpthread
+
+# the quantizer against the dequant that defines each block layout. ASan.
+$(B)/test_quantize: tests/test_quantize.c src/quantize.c src/quant.c src/loader.c $(wildcard src/*.h include/*.h) | $(B)
+	$(CC) $(TCFLAGS) -o $@ tests/test_quantize.c src/quantize.c src/quant.c src/loader.c -lm -lpthread
 
 # On-disk KV prefix: round-trip into a synthetic context, refuse a corrupted
 # header, a truncated body and a foreign model. ASan, like test_attn.
@@ -103,17 +124,24 @@ SAN := $(shell printf 'int main(void){return 0;}\n' | $(CC) -fsanitize=address,u
 # The ASan gates, one command. Built as files, RUN every time: with the run
 # inside the build rule, a second `make test` said "nothing to be done" and
 # tested nothing.
-test: $(B)/test_attn $(B)/test_kvc $(B)/test_q8 $(B)/test_load
+test: $(B)/test_attn $(B)/test_arch $(B)/test_train $(B)/test_quantize $(B)/test_kvc $(B)/test_q8 $(B)/test_load werror-check
 	@[ -n "$(SAN)" ] || echo "test: this compiler has no ASan/UBSan — running the tests without them"
-	@$(B)/test_attn && $(B)/test_kvc && $(B)/test_q8 && $(B)/test_load
+	@$(B)/test_attn && $(B)/test_arch && $(B)/test_train && $(B)/test_quantize && $(B)/test_kvc && $(B)/test_q8 && $(B)/test_load
+
+# hakm's own sources with the release flags and warnings as errors. the tests
+# build without -ffast-math, so they never saw clang call quantize.c's
+# INFINITY undefined under it (the fallback it guarded could be folded away)
+werror-check:
+	@for f in cli/main.c $(SRC); do $(CC) $(CFLAGS) -Werror -c $$f -o /dev/null || exit 1; done
+	@echo "werror-check: hakm compiles clean with the release flags"
 
 # convert an ollama/HF gguf into our native format
 %.mlf2:
 	@echo "run: python3 tools/gguf2mlf.py <model.gguf> $@"
 
 clean:
-	rm -rf hakm $(B) $(LIBA) $(EMBED_OBJ) $(OBJ)
-	rm -rf test_quant test_kdot test_api test_kvc test_attn test_q8 test_load *.dSYM
+	rm -rf hakm hakm-train $(B) $(LIBA) $(EMBED_OBJ) $(OBJ)
+	rm -rf test_quant test_kdot test_api test_kvc test_attn test_arch test_quantize test_q8 test_load *.dSYM
 
 # The NEON paths, compiled for arm64 with warnings as errors. x86 builds never see that
 # code, and v0.0.4's first tag failed on both ARM builders for a missing include.
@@ -126,5 +154,5 @@ arm-check:
 			-Iinclude -Isrc -c $$f -o /dev/null || exit 1; done; done; \
 	echo "arm-check: every NEON path compiles for arm64 (armv8-a and +dotprod)"
 
-.PHONY: all clean lib test arm-check $(TESTS)
+.PHONY: all clean lib test train arm-check werror-check $(TESTS)
 lib: $(LIBA)

@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint16_t f32_to_f16(float f) {   /* round-to-nearest, normal range only */
+static uint16_t t_f16(float f) {   /* round-to-nearest, normal range only */
 	uint32_t x; memcpy(&x, &f, 4);
 	uint32_t sign = (x >> 16) & 0x8000;
 	int32_t  exp  = (int32_t)((x >> 23) & 0xff) - 127 + 15;
@@ -26,7 +26,7 @@ int main(void) {
 	block_q8_0 *row = malloc((size_t)(N / 32) * sizeof(block_q8_0));
 	float *x = malloc((size_t)N * sizeof(float)), *w = malloc((size_t)N * sizeof(float));
 	for (int i = 0; i < N / 32; i++) {
-		row[i].d = f32_to_f16(0.001f + (float)(rand() % 1000) / 10000.0f);
+		row[i].d = t_f16(0.001f + (float)(rand() % 1000) / 10000.0f);
 		for (int l = 0; l < 32; l++) row[i].qs[l] = (int8_t)(rand() % 255 - 127);
 	}
 	for (int i = 0; i < N; i++) x[i] = ((float)rand() / RAND_MAX - 0.5f) * 4.0f;

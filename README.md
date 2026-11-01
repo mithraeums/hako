@@ -1,6 +1,9 @@
 <p align="center">
   <a href="https://mithraeums.github.io">
-    <img src="https://mithraeums.github.io/assets/banner-hako.png" alt="hako — a from-scratch C inference engine for the inner chamber" width="100%"/>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://mithraeums.github.io/assets/banner-hako-night.png"/>
+      <img src="https://mithraeums.github.io/assets/banner-hako.png" alt="hako — a from-scratch C inference engine for the inner chamber" width="100%"/>
+    </picture>
   </a>
 </p>
 
@@ -9,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.4-e2402e?style=flat-square&labelColor=14130f" alt="v0.0.4"/></a>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.5-e2402e?style=flat-square&labelColor=14130f" alt="v0.0.5"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/deps-libc%20%2B%20libm%20%2B%20pthread-2636c4?style=flat-square&labelColor=14130f" alt="deps"/>
   <img src="https://img.shields.io/badge/runtime-no%20llama.cpp%20%C2%B7%20no%20ollama-2636c4?style=flat-square&labelColor=14130f" alt="no llama.cpp / no ollama"/>
@@ -22,34 +25,25 @@
 
 <br>
 
-<!-- HERO: vhs/demo.tape — hakm --version, then a live streaming generation ending on the honest prefill/decode split line. -->
+<!-- terminal media: real sessions through a pty, drawn in the night terminal at 2x (Code/mithraeums/.claude/web/look/media.py).
+     one image per row, width only, never a height: GitHub can shrink them but never stretch them -->
 <p align="center">
-  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/demo.gif?raw=true" alt="hakm live generation" width="82%"/>
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/demo.gif?raw=true" alt="hakm --version, hakm list, then a live streaming answer from hako-sho ending on the prefill/decode split" width="100%"/>
 </p>
 
-<table align="center">
-  <tr>
-    <td align="center" width="33%">
-      <!-- vhs/info.tape — `hakm --info` arch banner. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/screenshot-info.png?raw=true" alt="hakm --info arch banner" width="100%"/><br/>
-      <sub><code>--info</code> · arch · params · GQA · ctx</sub>
-    </td>
-    <td align="center" width="33%">
-      <!-- vhs/raw.tape — raw completion. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/screenshot-raw.png?raw=true" alt="raw completion" width="100%"/><br/>
-      <sub><code>--raw</code> · greedy completion</sub>
-    </td>
-    <td align="center" width="33%">
-      <!-- vhs/chat.tape — one chat turn with the honest prefill/decode split. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/screenshot-chat.png?raw=true" alt="one chat turn" width="100%"/><br/>
-      <sub>one ChatML turn · honest tok/s split</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/info.png?raw=true" alt="hakm hako-sho --info: arch, parameters, layers, heads with GQA, context" width="100%"/><br/>
+  <sub><code>--info</code>: arch, params, GQA, context</sub>
+</p>
+
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako/raw.png?raw=true" alt="a raw greedy completion of def fibonacci(n):" width="100%"/><br/>
+  <sub><code>--raw</code>: a plain greedy completion, then the honest tok/s split</sub>
+</p>
 
 <table>
   <tr>
-    <td width="33%" valign="top"><b>From scratch.</b><br/><sub>Own GGUF→MLF2 loader, own Q4_K/Q6_K + int8 kernels, own byte-level BPE, own Qwen2 forward pass. No ggml, no llama.cpp, no torch.</sub></td>
+    <td width="33%" valign="top"><b>From scratch.</b><br/><sub>Own GGUF and safetensors → MLF2 loader, own quantizer, own Q4_K/Q6_K + int8 kernels, own byte-level BPE, own forward pass (qwen2, qwen3, llama), own trainer. No ggml, no llama.cpp, no torch.</sub></td>
     <td width="33%" valign="top"><b>Three deps.</b><br/><sub>libc + libm + pthread. That is the whole stack. <code>make</code> builds <code>./hakm</code> on Linux / macOS / FreeBSD.</sub></td>
     <td width="33%" valign="top"><b>Resident + fast.</b><br/><sub><code>--serve</code> keeps the model warm and reuses the KV prefix across turns. Batched prefill, FMA q4k, a Q6_K int8 path, threaded attention, f16 KV — <code>~8 tok/s</code> decode on a CPU-only i3.</sub></td>
   </tr>
@@ -66,7 +60,7 @@ resident and reuses the KV cache — and [hako-edit](https://github.com/mithraeu
 (the editor) reaches it through the agent. You can also run it directly.
 
 - **No ggml, no llama.cpp, no torch, no ollama.** The loader, the k-quant +
-  int8 kernels, the BPE tokenizer, and the Qwen2 forward pass are all
+  int8 kernels, the BPE tokenizer, and the forward pass (qwen2, qwen3, llama) are all
   hand-written C11. libc + libm + pthread is the entire runtime.
 - **Own container format — MLF2.** `tools/gguf2mlf.py` converts a Qwen2.5-Coder
   GGUF to a native MLF2 file once (pure stdlib): k-quant blocks copied verbatim,
@@ -106,8 +100,21 @@ hakm pull hako-sho      # resumable, checked, installed to ~/.hako/models/
 hakm list               # what is installed
 # (inside the agent: :pull hako-sho does the same)
 
-# or convert a Qwen2.5-Coder GGUF yourself, once:
+# or convert one yourself, once — from a GGUF, or from a Hugging Face folder:
 python3 tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho/hako-sho.mlf2
+python3 tools/hf2mlf.py ./Qwen3-0.6B qwen3-0.6b-bf16.mlf2
+
+# then make it small, and check what that cost:
+hakm quantize qwen3-0.6b-bf16.mlf2 qwen3-0.6b.mlf2 q4_k
+hakm qwen3-0.6b.mlf2 --ppl wiki.test.raw
+
+# or train one of your own, tokenizer included (make train):
+hakm-train --data wiki.train.raw --val wiki.valid.raw --out tiny.mlf2 --steps 1500 --lr 2e-3
+hakm tiny.mlf2 --raw "The history of the city"
+
+# it runs at the lowest priority and prints the memory it will hold. overnight,
+# out of the way (caffeinate keeps a mac awake; --at holds even the memory until then):
+caffeinate -i hakm-train --data wiki.train.raw --out tiny.mlf2 --at 01:00 --threads 4
 ```
 
 | model | tier | base | license |
@@ -216,32 +223,24 @@ across batch columns) — not more threads.
 
 ## Change Log
 
-### Latest — engine v0.0.4
+### Latest — engine v0.0.5
 
-- **Local answers stream** — `--serve` sends each token as it is sampled
-  (`T <len>` frames; opt-in via a 4th header field, so old callers and old
-  engines are unaffected). The agent types a local reply out in real time.
-- **KV prefix on disk** — the prefilled system prompt is saved under
-  `~/.hako/cache/kv/` and restored on the next run: cold first turn on the i3
-  went from **255 s to 2.3 s**. Keyed on model size+mtime, layers, kv dim, kv
-  type and the exact token ids; `--no-kv-cache` opts out.
-- **…and the cache is bounded** — one file per distinct system prompt, and
-  nothing ever deleted them (359 MB piled up before anyone looked). Oldest
-  first to `HAKM_KV_DIR_MAX_MB` (default 1024; `0` disables), the just-written
-  entry exempt.
-- **Small models no longer overflow** — `att_heads` indexed its scores by
-  position but two call sites passed a buffer sized by `ffn_dim`; safe for
-  sho/koi, a heap overflow for anything smaller. `make test_attn` reproduces
-  it under ASan if undone.
-- **32-bit / iSh** — builds on musl (`-D_DEFAULT_SOURCE`, `posix_madvise`); no
-  `-march=native` on i386, where the emulator advertises AVX/FMA it cannot run
-  (that was SIGILL mid-prefill); prefault off; a model larger than the address
-  space is refused with a message instead of a SIGBUS.
-- **Model store** — `hakm list | pull | rm`, resumable pulls, atomic install;
-  **llama arch** (SmolLM2 proven) and **Q8_0** (`make test_q8`).
-- **Damaged files are refused** — a truncated download or a corrupt tokenizer
-  gets a message (`model file is incomplete … run hakm pull again`) instead of a
-  segfault; `make test` builds damaged files and checks each one.
+- **A model of our own, end to end** — `hakm-train` (`make train`) trains a
+  byte-level BPE and the engine's own shape from scratch on the CPU, in C, and
+  writes an MLF2 file hakm runs and quantizes as is. 4.5M params on wikitext-2:
+  val ppl **171 → 60** in 13 min on the i3. Every gradient is checked against a
+  finite difference in `make test`.
+- **Own quantizer and a number to judge it by** — `hakm quantize` to q4_k /
+  q6_k / q8_0 / f16 / bf16, and `--ppl` (plus bits per byte). Qwen3-0.6B on
+  wikitext-2: bf16 21.16, q8_0 21.20, q4_k 22.72.
+- **Hugging Face straight in** — `tools/hf2mlf.py` reads safetensors (bf16
+  runs as is), byte-identical to the GGUF route. No GGUF in between.
+- **Qwen3 runs** — per-head q/k norm and attention width apart from `d_model`;
+  model features come from the file, not the arch name.
+- **x86 release builds ~3x faster** — a `x86-64-v3` build with the AVX2/FMA
+  paths, picked by `install.sh` (and an `x86_64h` slice on macOS).
+- **`tools/mkcorpus.py`** — a training corpus from permissive sources only,
+  with a manifest of every source and its license.
 
 Earlier versions, and the full detail: [CHANGELOG.md](CHANGELOG.md).
 
@@ -261,16 +260,20 @@ Earlier versions, and the full detail: [CHANGELOG.md](CHANGELOG.md).
 ```
 src/loader.c       mmap MLF2, resolve tensors, refuse damaged files
 src/quant.c        Q4_K / Q6_K / Q8_0 dequant + int8 fast dot (bit-exact)
+src/quantize.c     float → f16 / bf16 / Q8_0 / Q4_K / Q6_K, and `hakm quantize`
 src/nn.c           rmsnorm, softmax, SiLU, rope, matmul, worker pool
-src/model.c        Qwen2 / llama forward — GQA, KV cache, batched prefill, threaded attn
+src/model.c        the forward pass (qwen2 / qwen3 / llama / hako) — GQA, KV cache, batched prefill, threaded attn
 src/bpe.c          byte-level BPE (encode + decode)
 src/sample.c       temp / top-k / top-p / greedy, repetition penalty
 src/kvcache.c      the system-prompt KV prefix on disk, with eviction
 src/models.c       hakm list / pull / rm — the model store
+src/train.c        the trainer: backward pass, AdamW, BPE training, MLF2 out
 src/hakm_api.c     optional in-process library (libhakm.a); not the agent's path
 cli/main.c         the hakm CLI — one-shot / raw / REPL / --chat-stdin / --serve
+cli/train.c        hakm-train, the training loop (make train)
 include/mlf2.h     the native container format
 tools/gguf2mlf.py  offline GGUF → MLF2 converter (pure stdlib)
+tools/hf2mlf.py    offline safetensors → MLF2 converter (pure stdlib)
 tests/             make test (ASan) + the real-weights checks and q_ref.py
 install.sh         the installer behind mithraeums.github.io/hakm.sh
 ```

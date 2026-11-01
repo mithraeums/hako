@@ -53,21 +53,9 @@ void rope_norm(float *vec, int head_dim, int pos, float theta) {
 	}
 }
 
-/* bytes occupied by one row of n_in elements of the given type. */
-static size_t row_nbytes(int type, int n_in) {
-	switch (type) {
-	case MLF2_TYPE_F32:  return (size_t)n_in * 4;
-	case MLF2_TYPE_F16:  return (size_t)n_in * 2;
-	case MLF2_TYPE_Q4_K: return (size_t)(n_in / QK_K) * 144;
-	case MLF2_TYPE_Q6_K: return (size_t)(n_in / QK_K) * 210;
-	case MLF2_TYPE_Q8_0: return (size_t)(n_in / 32) * 34;
-	default:             return 0;
-	}
-}
-
 void deq_row(const hakm_model *m, const mlf2_tensor *w, int r, int n_in, float *out) {
 	const unsigned char *base = (const unsigned char *)mlf2_data(m, w);
-	size_t rb = row_nbytes((int)w->type, n_in);
+	size_t rb = quant_row_bytes((int)w->type, n_in);
 	dequant_tensor((int)w->type, base + (size_t)r * rb, out, n_in);
 }
 
@@ -220,7 +208,7 @@ void matmul_batch(float *out, const float *x,
                   const float *bias, int n_out, int n_in, int B) {
 	int T = hakm_nthreads();
 	if (n_out < T) T = 1;
-	size_t rb = row_nbytes((int)w->type, n_in);
+	size_t rb = quant_row_bytes((int)w->type, n_in);
 
 	/* For the k-quant fast paths, quantize all B activation rows once and
 	   share them across all output rows / threads (read-only). n_in is always

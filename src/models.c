@@ -91,18 +91,7 @@ static const char *quant_name(const hakm_model *m) {
 		if (m->tensors[i].type < 32) by[m->tensors[i].type] += m->tensors[i].nbytes;
 	uint32_t best = 0;
 	for (uint32_t t = 1; t < 32; t++) if (by[t] > by[best]) best = t;
-	switch (best) {
-	case MLF2_TYPE_F32:  return "f32";
-	case MLF2_TYPE_F16:  return "f16";
-	case MLF2_TYPE_Q4_K: return "q4_k";
-	case MLF2_TYPE_Q6_K: return "q6_k";
-	case MLF2_TYPE_Q8_0: return "q8_0";
-	default: return "?";
-	}
-}
-
-static const char *arch_name(uint32_t a) {
-	return a == MLF2_ARCH_QWEN2 ? "qwen2" : a == MLF2_ARCH_LLAMA ? "llama" : "?";
+	return mlf2_type_name(best);
 }
 
 int hakm_list(void) {
@@ -129,8 +118,9 @@ int hakm_list(void) {
 			params += ne;
 		}
 		int kv = kvc_for_model((unsigned long long)st.st_size, (unsigned long long)st.st_mtime, 0);
-		printf("%-20s %6.2fGB  %-5s  %-6s  %5.1fB  ", de->d_name,
-		       (double)st.st_size / 1e9, quant_name(&m), arch_name(m.h.arch), params / 1e9);
+		printf("%-20s %6.2fGB  %-5s  %-6s  %5.1f%s  ", de->d_name,
+		       (double)st.st_size / 1e9, quant_name(&m), mlf2_arch_name(m.h.arch),
+		       params >= 1e9 ? params / 1e9 : params / 1e6, params >= 1e9 ? "B" : "M");
 		if (kv) printf("%d\n", kv); else printf("-\n");
 		mlf2_close(&m);
 		n++;

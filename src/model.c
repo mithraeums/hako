@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
-/* model.c — Qwen2 incremental forward pass with KV cache. */
+/* model.c — incremental forward pass with KV cache. */
 #include "model.h"
 #include "nn.h"
+#include "quant.h"
 #include "../include/mlf2.h"
 
 #include <math.h>
@@ -9,10 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* One forward pass, two RoPE pairings; the header says which. */
+/* One forward pass, two RoPE pairings; the file says which. */
 #define ROPE(v, hd, pos, th) \
-	((c->model.h.arch == MLF2_ARCH_LLAMA) ? rope_norm((v), (hd), (pos), (th)) \
-	                                      : rope_neox((v), (hd), (pos), (th)))
+	(c->rope_norm ? rope_norm((v), (hd), (pos), (th)) : rope_neox((v), (hd), (pos), (th)))
 
 static const mlf2_tensor *need(const hakm_model *m, const char *name) {
 	const mlf2_tensor *t = mlf2_find(m, name);
@@ -26,11 +26,26 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 	if (mlf2_open(path, &c->model) != 0) { free(c); return NULL; }
 
 	const mlf2_header *h = &c->model.h;
+	if (h->arch >= MLF2_ARCH_COUNT || (h->flags & ~MLF2_FLAGS_KNOWN) || !h->n_heads ||
+	    !h->n_kv_heads || !h->head_dim || h->n_heads % h->n_kv_heads) {
+		fprintf(stderr, "hakm: unsupported model (arch %u, flags %#x, heads %u/%u, head_dim %u) — "
+		        "newer than this engine?\n", h->arch, h->flags, h->n_heads, h->n_kv_heads, h->head_dim);
+		mlf2_close(&c->model); free(c); return NULL;
+	}
+	for (uint32_t i = 0; i < h->n_tensors; i++) {
+		const mlf2_tensor *t = &c->model.tensors[i];
+		if (!quant_row_bytes((int)t->type, (int)t->dims[0])) {
+			fprintf(stderr, "hakm: tensor %.48s has type %u, which this engine cannot run\n", t->name, t->type);
+			mlf2_close(&c->model); free(c); return NULL;
+		}
+	}
 	c->d_model = h->d_model; c->n_heads = h->n_heads;
 	c->n_kv_heads = h->n_kv_heads; c->head_dim = h->head_dim;
+	c->q_dim = h->n_heads * h->head_dim;
 	c->kv_dim = h->n_kv_heads * h->head_dim;
 	c->ffn_dim = h->ffn_dim; c->n_layers = h->n_layers; c->vocab = h->vocab;
 	c->rope_theta = h->rope_theta; c->rms_eps = h->rms_eps;
+	c->rope_norm = (h->flags & MLF2_FLAG_ROPE_NORM) || h->arch == MLF2_ARCH_LLAMA;
 	c->max_seq = max_seq; c->pos = 0;
 
 	c->tok_embd = need(&c->model, "token_embd.weight");
@@ -61,17 +76,21 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 		snprintf(nm, sizeof nm, "blk.%d.attn_q.bias", l); L->bq = mlf2_find(&c->model, nm);
 		snprintf(nm, sizeof nm, "blk.%d.attn_k.bias", l); L->bk = mlf2_find(&c->model, nm);
 		snprintf(nm, sizeof nm, "blk.%d.attn_v.bias", l); L->bv = mlf2_find(&c->model, nm);
+		snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", l); L->q_norm = mlf2_find(&c->model, nm);
+		snprintf(nm, sizeof nm, "blk.%d.attn_k_norm.weight", l); L->k_norm = mlf2_find(&c->model, nm);
+		if (!L->q_norm != !L->k_norm) { fprintf(stderr, "hakm: layer %d has only one of q/k norm\n", l); ok = 0; }
 	}
 	if (!ok) { hakm_ctx_free(c); return NULL; }
 
-	int D = c->d_model, F = c->ffn_dim, KV = c->kv_dim, V = c->vocab;
+	int D = c->d_model, Q = c->q_dim, F = c->ffn_dim, KV = c->kv_dim, V = c->vocab;
 	int scratch_max = F > D ? F : D;
+	if (Q > scratch_max) scratch_max = Q;
 	c->xb = calloc(D, sizeof(float));
 	c->xn = calloc(D, sizeof(float));
-	c->q  = calloc(D, sizeof(float));
+	c->q  = calloc(Q, sizeof(float));
 	c->k  = calloc(KV, sizeof(float));
 	c->v  = calloc(KV, sizeof(float));
-	c->att_out = calloc(D, sizeof(float));
+	c->att_out = calloc(Q, sizeof(float));
 	c->gate_buf = calloc(F, sizeof(float));
 	c->up_buf   = calloc(F, sizeof(float));
 	c->deq      = calloc(scratch_max, sizeof(float));
@@ -101,6 +120,21 @@ void hakm_reset(hakm_ctx *c) { c->pos = 0; }
 
 static const float *fdata(const hakm_ctx *c, const mlf2_tensor *t) {
 	return (const float *)mlf2_data(&c->model, t);
+}
+
+/* Per-head q/k norm (when the file has it), then RoPE, for one token's q and k. */
+static void qk_rope(const hakm_ctx *c, const layer_t *L, float *q, float *k, int pos) {
+	int hd = c->head_dim;
+	const float *qn = L->q_norm ? fdata(c, L->q_norm) : NULL;
+	const float *kn = L->k_norm ? fdata(c, L->k_norm) : NULL;
+	for (int h = 0; h < c->n_heads; h++) {
+		if (qn) rmsnorm(q + h * hd, q + h * hd, qn, hd, c->rms_eps);
+		ROPE(q + h * hd, hd, pos, c->rope_theta);
+	}
+	for (int h = 0; h < c->n_kv_heads; h++) {
+		if (kn) rmsnorm(k + h * hd, k + h * hd, kn, hd, c->rms_eps);
+		ROPE(k + h * hd, hd, pos, c->rope_theta);
+	}
 }
 
 
@@ -201,11 +235,11 @@ static void att_heads(hakm_ctx *c, int l, int pos, const float *q,
 static void att_batch_run(void *arg) {
 	att_job *j = (att_job *)arg;
 	hakm_ctx *c = j->c;
-	int D = c->d_model;
+	int Q = c->q_dim;
 	for (int b = j->b0; b < j->b1; b++) {
-		float *att = c->batt + (size_t)b * D;
-		memset(att, 0, D * sizeof(float));
-		att_heads(c, j->l, j->pos0 + b, c->bq + (size_t)b * D,
+		float *att = c->batt + (size_t)b * Q;
+		memset(att, 0, Q * sizeof(float));
+		att_heads(c, j->l, j->pos0 + b, c->bq + (size_t)b * Q,
 		          0, c->n_heads, att, c->bscores + (size_t)b * c->max_seq);
 	}
 }
@@ -216,7 +250,7 @@ static void att_decode_run(void *arg) {
 }
 
 const float *hakm_forward(hakm_ctx *c, int token) {
-	int D = c->d_model, H = c->n_heads, KVH = c->n_kv_heads, hd = c->head_dim;
+	int D = c->d_model, Q = c->q_dim, H = c->n_heads;
 	int KV = c->kv_dim, F = c->ffn_dim, pos = c->pos;
 
 	/* 1. embedding lookup */
@@ -229,13 +263,12 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 		rmsnorm(c->xn, c->xb, fdata(c, L->attn_norm), D, c->rms_eps);
 
 		/* 2b. QKV projections (+bias) */
-		matmul(c->q, c->xn, &c->model, L->wq, L->bq ? fdata(c, L->bq) : NULL, D,  D);
+		matmul(c->q, c->xn, &c->model, L->wq, L->bq ? fdata(c, L->bq) : NULL, Q,  D);
 		matmul(c->k, c->xn, &c->model, L->wk, L->bk ? fdata(c, L->bk) : NULL, KV, D);
 		matmul(c->v, c->xn, &c->model, L->wv, L->bv ? fdata(c, L->bv) : NULL, KV, D);
 
-		/* 2c. rope (neox) on each head of q and k */
-		for (int h = 0; h < H;   h++) ROPE(c->q + h * hd, hd, pos, c->rope_theta);
-		for (int h = 0; h < KVH; h++) ROPE(c->k + h * hd, hd, pos, c->rope_theta);
+		/* 2c. q/k norm + rope on each head of q and k */
+		qk_rope(c, L, c->q, c->k, pos);
 
 		/* 2d. write k,v into cache at this position */
 		kv_store(c->k_cache + ((size_t)l * c->max_seq + pos) * KV, c->k, KV);
@@ -243,7 +276,7 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 
 		/* 2e. GQA attention over positions 0..pos — threaded over heads once
 		   the context is deep enough to beat the pool dispatch (~tens of µs) */
-		memset(c->att_out, 0, D * sizeof(float));
+		memset(c->att_out, 0, Q * sizeof(float));
 		int T = hakm_nthreads();
 		if (pos >= 64 && T > 1) {
 			att_job aj[16];
@@ -265,7 +298,7 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 		}
 
 		/* 2f. output proj, residual */
-		matmul(c->xn, c->att_out, &c->model, L->wo, NULL, D, D);
+		matmul(c->xn, c->att_out, &c->model, L->wo, NULL, D, Q);
 		for (int i = 0; i < D; i++) c->xb[i] += c->xn[i];
 
 		/* 2g. ffn rmsnorm */
@@ -290,15 +323,15 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 /* Grow the batch scratch to hold `cap` token rows. Returns 0 ok, -1 oom. */
 static int batch_scratch(hakm_ctx *c, int cap) {
 	if (cap <= c->batch_cap) return 0;
-	int D = c->d_model, F = c->ffn_dim, KV = c->kv_dim;
+	int D = c->d_model, Q = c->q_dim, F = c->ffn_dim, KV = c->kv_dim;
 	free(c->bxb); free(c->bxn); free(c->bq); free(c->bk); free(c->bv);
 	free(c->batt); free(c->bgate); free(c->bup); free(c->bscores);
 	c->bxb  = malloc((size_t)cap * D  * sizeof(float));
 	c->bxn  = malloc((size_t)cap * D  * sizeof(float));
-	c->bq   = malloc((size_t)cap * D  * sizeof(float));
+	c->bq   = malloc((size_t)cap * Q  * sizeof(float));
 	c->bk   = malloc((size_t)cap * KV * sizeof(float));
 	c->bv   = malloc((size_t)cap * KV * sizeof(float));
-	c->batt = malloc((size_t)cap * D  * sizeof(float));
+	c->batt = malloc((size_t)cap * Q  * sizeof(float));
 	c->bgate = malloc((size_t)cap * F * sizeof(float));
 	c->bup   = malloc((size_t)cap * F * sizeof(float));
 	c->bscores = malloc((size_t)cap * c->max_seq * sizeof(float));
@@ -308,13 +341,10 @@ static int batch_scratch(hakm_ctx *c, int cap) {
 	return 0;
 }
 
-const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
-	if (n > c->max_seq - c->pos) n = c->max_seq - c->pos;
-	if (n <= 0) return NULL;
-	if (n == 1) return hakm_forward(c, toks[0]);
-	if (batch_scratch(c, n) != 0) return NULL;
-
-	int D = c->d_model, H = c->n_heads, KVH = c->n_kv_heads, hd = c->head_dim;
+/* The layers of a batched pass: leaves the final hidden state of each of the n
+   tokens in bxb and their k/v in the cache. Does not move c->pos. */
+static void batch_layers(hakm_ctx *c, const int *toks, int n) {
+	int D = c->d_model, Q = c->q_dim;
 	int KV = c->kv_dim, F = c->ffn_dim, pos0 = c->pos;
 
 	/* 1. embedding lookup, all n tokens */
@@ -330,15 +360,14 @@ const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
 			        fdata(c, L->attn_norm), D, c->rms_eps);
 
 		/* 2b. QKV projections (+bias), batched */
-		matmul_batch(c->bq, c->bxn, &c->model, L->wq, L->bq ? fdata(c, L->bq) : NULL, D,  D, n);
+		matmul_batch(c->bq, c->bxn, &c->model, L->wq, L->bq ? fdata(c, L->bq) : NULL, Q,  D, n);
 		matmul_batch(c->bk, c->bxn, &c->model, L->wk, L->bk ? fdata(c, L->bk) : NULL, KV, D, n);
 		matmul_batch(c->bv, c->bxn, &c->model, L->wv, L->bv ? fdata(c, L->bv) : NULL, KV, D, n);
 
-		/* 2c. rope + 2d. cache write, per token */
+		/* 2c. q/k norm + rope, 2d. cache write, per token */
 		for (int b = 0; b < n; b++) {
-			float *qb = c->bq + (size_t)b * D, *kb = c->bk + (size_t)b * KV;
-			for (int h = 0; h < H;   h++) ROPE(qb + h * hd, hd, pos0 + b, c->rope_theta);
-			for (int h = 0; h < KVH; h++) ROPE(kb + h * hd, hd, pos0 + b, c->rope_theta);
+			float *qb = c->bq + (size_t)b * Q, *kb = c->bk + (size_t)b * KV;
+			qk_rope(c, L, qb, kb, pos0 + b);
 			kv_store(c->k_cache + ((size_t)l * c->max_seq + pos0 + b) * KV, kb, KV);
 			kv_store(c->v_cache + ((size_t)l * c->max_seq + pos0 + b) * KV, c->bv + (size_t)b * KV, KV);
 		}
@@ -361,7 +390,7 @@ const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
 		}
 
 		/* 2f. output proj, residual */
-		matmul_batch(c->bxn, c->batt, &c->model, L->wo, NULL, D, D, n);
+		matmul_batch(c->bxn, c->batt, &c->model, L->wo, NULL, D, Q, n);
 		for (int b = 0; b < n; b++)
 			for (int i = 0; i < D; i++) c->bxb[(size_t)b * D + i] += c->bxn[(size_t)b * D + i];
 
@@ -382,12 +411,49 @@ const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
 			for (int i = 0; i < D; i++) c->bxb[(size_t)b * D + i] += c->bxn[(size_t)b * D + i];
 	}
 
-	/* 3. final norm + lm_head — LAST token only (the rest of the batch only
+}
+
+const float *hakm_forward_batch(hakm_ctx *c, const int *toks, int n) {
+	if (n > c->max_seq - c->pos) n = c->max_seq - c->pos;
+	if (n <= 0) return NULL;
+	if (n == 1) return hakm_forward(c, toks[0]);
+	if (batch_scratch(c, n) != 0) return NULL;
+	batch_layers(c, toks, n);
+	/* final norm + lm_head — LAST token only (the rest of the batch only
 	   needed to populate the KV cache; skipping their vocab matmul saves ~10%
 	   of prefill compute on the 3B). */
+	int D = c->d_model;
 	rmsnorm(c->xn, c->bxb + (size_t)(n - 1) * D, fdata(c, c->out_norm), D, c->rms_eps);
 	matmul(c->logits, c->xn, &c->model, c->out_weight, NULL, c->vocab, D);
-
-	c->pos = pos0 + n;
+	c->pos += n;
 	return c->logits;
+}
+
+double hakm_score_batch(hakm_ctx *c, const int *toks, int n, int from) {
+	if (n > c->max_seq - c->pos) n = c->max_seq - c->pos;
+	if (n < 2 || batch_scratch(c, n) != 0) return -1;
+	batch_layers(c, toks, n);
+	enum { R = 16 };
+	int D = c->d_model, V = c->vocab;
+	float *xn = malloc((size_t)R * D * sizeof(float)), *lg = malloc((size_t)R * V * sizeof(float));
+	double nll = 0;
+	if (!xn || !lg) { free(xn); free(lg); return -1; }
+	if (from < 0) from = 0;
+	for (int b0 = from; b0 < n - 1; b0 += R) {
+		int r = n - 1 - b0 < R ? n - 1 - b0 : R;
+		for (int i = 0; i < r; i++)
+			rmsnorm(xn + (size_t)i * D, c->bxb + (size_t)(b0 + i) * D, fdata(c, c->out_norm), D, c->rms_eps);
+		matmul_batch(lg, xn, &c->model, c->out_weight, NULL, V, D, r);
+		for (int i = 0; i < r; i++) {
+			const float *z = lg + (size_t)i * V;
+			float mx = z[0];
+			for (int v = 1; v < V; v++) if (z[v] > mx) mx = z[v];
+			double se = 0;
+			for (int v = 0; v < V; v++) se += exp((double)z[v] - mx);
+			nll += log(se) + mx - z[toks[b0 + i + 1]];
+		}
+	}
+	free(xn); free(lg);
+	c->pos += n;
+	return nll;
 }

@@ -400,6 +400,18 @@ float q6k_vec_dot(const void *w_row, int n_in, const int8_t *xq, const float *xs
 	return acc;
 }
 
+size_t quant_row_bytes(int type, int nelem) {
+	switch (type) {
+	case MLF2_TYPE_F32:  return (size_t)nelem * 4;
+	case MLF2_TYPE_F16:
+	case MLF2_TYPE_BF16: return (size_t)nelem * 2;
+	case MLF2_TYPE_Q8_0: return nelem % 32 ? 0 : (size_t)(nelem / 32) * sizeof(block_q8_0);
+	case MLF2_TYPE_Q4_K: return nelem % QK_K ? 0 : (size_t)(nelem / QK_K) * sizeof(block_q4_K);
+	case MLF2_TYPE_Q6_K: return nelem % QK_K ? 0 : (size_t)(nelem / QK_K) * sizeof(block_q6_K);
+	default:             return 0;
+	}
+}
+
 int dequant_tensor(int type, const void *src, float *out, int nelem) {
 	switch (type) {
 	case MLF2_TYPE_F32:
@@ -408,6 +420,11 @@ int dequant_tensor(int type, const void *src, float *out, int nelem) {
 	case MLF2_TYPE_F16: {
 		const uint16_t *h = (const uint16_t *)src;
 		for (int i = 0; i < nelem; i++) out[i] = f16_to_f32(h[i]);
+		return 0;
+	}
+	case MLF2_TYPE_BF16: {
+		const uint16_t *h = (const uint16_t *)src;
+		for (int i = 0; i < nelem; i++) { uint32_t u = (uint32_t)h[i] << 16; memcpy(&out[i], &u, 4); }
 		return 0;
 	}
 	case MLF2_TYPE_Q4_K: dequant_q4_K(src, out, nelem); return 0;

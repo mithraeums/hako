@@ -31,6 +31,17 @@ typedef struct {
                             of 256) and every "Q8_0" GGUF are made of */
 
 float f16_to_f32(uint16_t h);
+uint16_t f32_to_f16(float f);       /* round to nearest even (quantize.c) */
+
+/* Bytes for nelem values of a type, or 0 for a type this engine does not know
+ * or an nelem that does not fill whole blocks. */
+size_t quant_row_bytes(int type, int nelem);
+/* quantize.c — float to a type (F32, F16, BF16, Q8_0, Q4_K, Q6_K). Returns the
+ * bytes written, 0 when quant_row_bytes would. */
+size_t quantize_tensor(int type, const float *src, void *dst, int nelem);
+/* Rewrite a model file at another type ("q4_k" = the q4_k_m mix, q6_k, q8_0,
+ * f16, f32), any input type. Written to <out>.part, renamed when complete. */
+int hakm_quantize(const char *in, const char *out, const char *type_name);
 
 /* Dequantize `nelem` values (nelem must be a multiple of QK_K) into `out`. */
 void dequant_q4_K(const void *blocks, float *out, int nelem);

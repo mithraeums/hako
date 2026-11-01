@@ -35,14 +35,29 @@ extern "C" {
 #define MLF2_ALIGN     32u
 #define MLF2_MAX_NAME  48u   /* tensor names fit Qwen ("blk.35.ffn_down.weight") */
 
-/* Architecture id. The forward pass is one shape (RMSNorm → GQA attention →
- * RoPE → SwiGLU); what differs per arch is RoPE pairing and optional bias:
+/* Architecture id: a label, not a code path. The forward pass is one shape
+ * (RMSNorm → GQA attention → RoPE → SwiGLU) and every difference between
+ * models is a feature of the FILE: q/k/v bias and per-head q/k norm are used
+ * when their tensors exist, the attention width is n_heads * head_dim (need not
+ * equal d_model), and the RoPE pairing is MLF2_FLAG_ROPE_NORM. A model of our
+ * own is arch "hako" plus whichever features it uses.
  *   qwen2  neox rope (i, i+d/2), q/k/v bias
- *   llama  norm rope (2i, 2i+1), no bias — also mistral, smollm, tinyllama */
+ *   llama  norm rope (2i, 2i+1), no bias — also mistral, smollm, tinyllama
+ *   qwen3  neox rope, no bias, q/k norm, head_dim 128 at every size
+ * Files written before ROPE_NORM existed say llama by arch id alone; the engine
+ * still reads them that way. */
 enum mlf2_arch {
 	MLF2_ARCH_QWEN2 = 0,
 	MLF2_ARCH_LLAMA = 1,
+	MLF2_ARCH_QWEN3 = 2,
+	MLF2_ARCH_HAKO  = 3,
+	MLF2_ARCH_COUNT
 };
+
+static inline const char *mlf2_arch_name(uint32_t a) {
+	static const char *const n[MLF2_ARCH_COUNT] = { "qwen2", "llama", "qwen3", "hako" };
+	return a < MLF2_ARCH_COUNT ? n[a] : "?";
+}
 
 /* Tensor element types — values MUST match ggml_type so the converter copies
  * blocks without transcoding. We only implement the subset Qwen Q4_K_M uses. */
@@ -52,11 +67,28 @@ enum mlf2_type {
 	MLF2_TYPE_Q8_0 = 8,
 	MLF2_TYPE_Q4_K = 12,
 	MLF2_TYPE_Q6_K = 14,
+	MLF2_TYPE_BF16 = 30,   /* what Hugging Face safetensors usually hold */
 };
+
+static inline const char *mlf2_type_name(uint32_t t) {
+	switch (t) {
+	case MLF2_TYPE_F32:  return "f32";
+	case MLF2_TYPE_F16:  return "f16";
+	case MLF2_TYPE_BF16: return "bf16";
+	case MLF2_TYPE_Q8_0: return "q8_0";
+	case MLF2_TYPE_Q4_K: return "q4_k";
+	case MLF2_TYPE_Q6_K: return "q6_k";
+	default:             return "?";
+	}
+}
 
 /* header.flags bits */
 #define MLF2_FLAG_QKV_BIAS    (1u << 0)  /* attn q/k/v have bias vectors */
 #define MLF2_FLAG_TIED_EMBED  (1u << 1)  /* lm_head == token_embd (no output.weight) */
+#define MLF2_FLAG_ROPE_NORM   (1u << 2)  /* rope pairs (2i, 2i+1); clear = neox (i, i+d/2) */
+/* A bit outside this mask is a feature this engine does not implement: the file
+ * is refused rather than run without it, which would give wrong logits. */
+#define MLF2_FLAGS_KNOWN      (MLF2_FLAG_QKV_BIAS | MLF2_FLAG_TIED_EMBED | MLF2_FLAG_ROPE_NORM)
 
 typedef struct __attribute__((packed)) {
 	char     magic[4];        /* "MLF2" */
@@ -66,7 +98,7 @@ typedef struct __attribute__((packed)) {
 	uint32_t d_model;         /* embedding_length */
 	uint32_t n_heads;         /* attention.head_count */
 	uint32_t n_kv_heads;      /* attention.head_count_kv (GQA) */
-	uint32_t head_dim;        /* d_model / n_heads, stored explicitly */
+	uint32_t head_dim;        /* attention.key_length, else d_model / n_heads */
 	uint32_t ffn_dim;         /* feed_forward_length */
 	uint32_t ctx;             /* context_length (max) */
 	uint32_t vocab;           /* token count */
