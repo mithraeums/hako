@@ -75,9 +75,10 @@ $(B)/test_attn: tests/test_attn.c src/model.c src/loader.c src/quant.c src/nn.c 
 	$(CC) $(TCFLAGS) -o $@ tests/test_attn.c src/loader.c src/quant.c src/nn.c -lm -lpthread
 
 # the forward pass vs a plain reference on a tiny model with q_dim != d_model
-# and per-head q/k norm (the Qwen3 shape). ASan, like test_attn.
+# and per-head q/k norm (the Qwen3 shape). ASan, like test_attn. $(ARCH) so
+# x86 runs the f16 KV cache the release builds (and every arm64 build) use.
 $(B)/test_arch: tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c $(wildcard src/*.h include/*.h) | $(B)
-	$(CC) $(TCFLAGS) -o $@ tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c -lm -lpthread
+	$(CC) $(TCFLAGS) $(ARCH) -o $@ tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c -lm -lpthread
 
 # the trainer: gradients vs finite differences, the engine scoring its file,
 # the BPE through the engine's encoder, checkpoints. ASan.

@@ -2,7 +2,15 @@
 
 All notable changes to the hako engine (`hakm`).
 
-## [v0.0.5] - 2026-11-01
+## [v0.0.6] - 2026-11-01
+
+v0.0.5 was tagged but never released: its arm64 builds (linux-arm64, macos-universal) failed `make test`. v0.0.6 is v0.0.5 plus the fix below; everything under v0.0.5 ships here.
+
+### fixed
+- **`test_arch` failed on every arm64 build.** the engine keeps K and V in f16 wherever the hardware converts (arm64, and x86 with F16C), and the test's plain f32 reference was held to 1e-3 against it. the x86 gate never saw it, because the test built without `$(ARCH)` and so ran an f32 cache. the reference now rounds K and V the way the engine does, and `test_arch` builds with `$(ARCH)` like `test_q8` and `test_train`, so x86 runs the f16 cache the release builds use. the old test fails 4 checks on x86 with `-march=x86-64-v3`; the new one passes 13 of 13 with either cache, under ASan. the engine itself did not change: qwen3 on arm64 was right, the test was not
+- **the faster x86 build was never uploaded.** the release job built `hakm-linux-x86_64-v3.tar.gz` but the publish step's file list left it out, so `install.sh` (which checks first) would have fallen back to the v2 build on every machine. it is published now. the macOS tarball also drops the AppleDouble `._hakm` the runner's tar added
+
+## [v0.0.5] - 2026-11-01 (tagged, not released)
 
 ### added
 - **release builds are ~3x faster on x86.** they were `x86-64-v2`, which leaves out the AVX2/FMA paths: on an i3-8100 sho decoded at 2.7 tok/s against 8.3-9.5 for an `x86-64-v3` build (prefill 4x). linux now also ships `hakm-linux-x86_64-v3`, which `install.sh` picks when `/proc/cpuinfo` has the v3 flags (else the v2 build, as before); the macOS universal binary gains an `x86_64h` slice, which macOS picks on a Haswell+ Intel Mac by itself. Apple Silicon was already fine (Apple's default arm64 target has dotprod)

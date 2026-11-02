@@ -5,6 +5,9 @@
    so this shape overflowed both buffers; under ASan the old code fails here. */
 #include "../src/model.h"
 #include <math.h>
+#if defined(HAKM_KV_F16) && defined(__F16C__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +119,20 @@ static void r_rope(float *v, int pos) {
 		v[i + HD / 2] = (float)(a * sin(ang) + b * cos(ang));
 	}
 }
+/* the engine keeps K and V in f16 where the hardware converts (model.h); the
+   reference rounds them the same way, so the tolerance stays tight on every
+   build. without this the test failed on arm64 and on F16C x86 */
+static void r_kv(float *v, int n) {
+#ifdef HAKM_KV_F16
+#if defined(__F16C__) && defined(__FMA__)
+	for (int i = 0; i < n; i++) v[i] = _cvtsh_ss(_cvtss_sh(v[i], 0));
+#else
+	for (int i = 0; i < n; i++) v[i] = (float)(__fp16)v[i];
+#endif
+#else
+	(void)v; (void)n;
+#endif
+}
 static void reference(const int *toks, int n, float *logits) {
 	static float x[16][D], xn[D], q[16][QD], k[16][KVD], v[16][KVD], att[QD], o[D], g[F], u[F];
 	char nm[48];
@@ -130,6 +147,7 @@ static void reference(const int *toks, int n, float *logits) {
 			r_mat(v[t], xn, G("attn_v.weight"), D, KVD);
 			for (int h = 0; h < H; h++) { if (qn) r_norm(q[t] + h * HD, q[t] + h * HD, qn, HD); r_rope(q[t] + h * HD, t); }
 			for (int h = 0; h < KVH; h++) { if (kn) r_norm(k[t] + h * HD, k[t] + h * HD, kn, HD); r_rope(k[t] + h * HD, t); }
+			r_kv(k[t], KVD); r_kv(v[t], KVD);
 		}
 		for (int t = 0; t < n; t++) {
 			for (int h = 0; h < H; h++) {

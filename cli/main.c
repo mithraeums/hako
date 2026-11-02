@@ -202,7 +202,7 @@ static int chatml_turn(const hakm_tok *tk, int im_start, int im_end,
 }
 
 #ifndef HAKM_VERSION
-#define HAKM_VERSION "0.0.5"
+#define HAKM_VERSION "0.0.6"
 #endif
 
 int main(int argc, char **argv) {

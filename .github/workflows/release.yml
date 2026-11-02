@@ -71,6 +71,8 @@ jobs:
         run: make test
 
       - name: Build hakm
+        env:
+          COPYFILE_DISABLE: 1   # no AppleDouble ._hakm in the macOS tarball
         run: |
           make ARCH="${{ matrix.arch }}"
           ./hakm --version 2>/dev/null || ./hakm 2>/dev/null | head -1 || true
@@ -150,6 +152,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/**/hakm-linux-x86_64.tar.gz
+            dist/**/hakm-linux-x86_64-v3.tar.gz
             dist/**/hakm-linux-arm64.tar.gz
             dist/**/hakm-macos-universal.tar.gz
             dist/**/hakm-freebsd-x86_64.tar.gz

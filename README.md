@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.5-e2402e?style=flat-square&labelColor=14130f" alt="v0.0.5"/></a>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.6-e2402e?style=flat-square&labelColor=14130f" alt="v0.0.6"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/deps-libc%20%2B%20libm%20%2B%20pthread-2636c4?style=flat-square&labelColor=14130f" alt="deps"/>
   <img src="https://img.shields.io/badge/runtime-no%20llama.cpp%20%C2%B7%20no%20ollama-2636c4?style=flat-square&labelColor=14130f" alt="no llama.cpp / no ollama"/>
@@ -223,7 +223,7 @@ across batch columns) — not more threads.
 
 ## Change Log
 
-### Latest — engine v0.0.5
+### Latest — engine v0.0.6
 
 - **A model of our own, end to end** — `hakm-train` (`make train`) trains a
   byte-level BPE and the engine's own shape from scratch on the CPU, in C, and
