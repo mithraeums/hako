@@ -2,6 +2,13 @@
 
 All notable changes to the hako engine (`hakm`).
 
+## [v0.0.8] - 2026-11-20
+
+v0.0.7 was tagged but never released: its linux builds failed `make test`. v0.0.8 is v0.0.7 plus the fix below; everything under v0.0.7 ships here.
+
+### fixed
+- **`werror-check` failed under gcc**, which the linux builds use and macOS does not: the trainer's vector helpers take and return 32-byte vectors, and gcc warns that such a call's ABI differs on a target without AVX (x86-64-v2, arm64); a tensor's name was copied from a 64-byte buffer into 48 bytes. the helpers are always inlined, so no vector crosses a call and gcc's ABI warning is silenced for that file, and the copy is bounded. clean under gcc 12 at the default target, x86-64-v2 and x86-64-v3, and under clang
+
 ## [v0.0.7] - 2026-11-19
 
 ### added

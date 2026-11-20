@@ -37,8 +37,13 @@ typedef float v8u __attribute__((vector_size(32), aligned(4)));
 typedef int v8i __attribute__((vector_size(32)));
 
 /* e^x, 8 lanes: x = n ln2 + r, a degree 6 polynomial for e^r (cephes), 2^n
-   built in the exponent bits; clamped to [-87, 88] so 2^n stays normal */
-static inline v8 vexp(v8 x) {
+   built in the exponent bits; clamped to [-87, 88] so 2^n stays normal. Always
+   inlined, like hsum, so no 32-byte vector ever crosses a call: gcc's warning that
+   such a call's ABI differs without AVX (x86-64-v2, arm64) is moot here */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wpsabi"
+#endif
+static inline __attribute__((always_inline)) v8 vexp(v8 x) {
 	const v8 hi = BC(88.0f), lo = BC(-87.0f), magic = BC(12582912.0f);
 	v8i mh = x > hi, ml = x < lo;
 	x = (v8)(((v8i)x & ~mh) | ((v8i)hi & mh));
@@ -54,7 +59,7 @@ static inline v8 vexp(v8 x) {
 	v8 y = p * r * r + r + BC(1.0f);
 	return y * (v8)((((v8i)t - 0x4B400000) + 127) << 23);
 }
-static inline float hsum(v8 s) { return ((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7])); }
+static inline __attribute__((always_inline)) float hsum(v8 s) { return ((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7])); }
 
 typedef struct { char name[MLF2_MAX_NAME]; size_t off; int rows, cols; } tr_tensor;
 /* what the backward needs of one layer's forward, [rows][width] each. g, u, h
@@ -340,7 +345,7 @@ static float gauss(uint64_t *s) {
 
 static size_t add_tensor(tr_model *m, size_t *at, const char *name, int rows, int cols) {
 	tr_tensor *t = &m->t[m->nt++];
-	snprintf(t->name, sizeof t->name, "%s", name);
+	snprintf(t->name, sizeof t->name, "%.*s", (int)sizeof t->name - 1, name);   /* names fit; gcc sees a 64-byte one */
 	t->off = *at; t->rows = rows; t->cols = cols;
 	*at += (size_t)rows * cols;
 	return t->off;
