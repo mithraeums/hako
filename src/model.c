@@ -20,6 +20,17 @@ static const mlf2_tensor *need(const hakm_model *m, const char *name) {
 	return t;
 }
 
+/* a weight the scratch is sized from must have exactly the shape it claims:
+   a wider expert than ffn_dim would run past bgate */
+static int shaped(const mlf2_tensor *t, uint64_t cols, uint64_t rows) {
+	if (t->n_dims == 2 && t->dims[0] == cols && t->dims[1] == rows) return 1;
+	fprintf(stderr, "hakm: tensor %.48s is not %llu x %llu\n", t->name,
+	        (unsigned long long)cols, (unsigned long long)rows);
+	return 0;
+}
+
+static int batch_scratch(hakm_ctx *c, int cap);
+
 hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 	hakm_ctx *c = calloc(1, sizeof(*c));
 	if (!c) return NULL;
@@ -47,6 +58,18 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 	c->rope_theta = h->rope_theta; c->rms_eps = h->rms_eps;
 	c->rope_norm = (h->flags & MLF2_FLAG_ROPE_NORM) || h->arch == MLF2_ARCH_LLAMA;
 	c->max_seq = max_seq; c->pos = 0;
+	/* the flag and the count must agree: a count without the flag is a file
+	   from something that does not know the format, run it and logits are wrong.
+	   an expert is three tensors, so a count past that is a corrupt header */
+	int moe = (h->flags & MLF2_FLAG_MOE) != 0;
+	if (moe != (h->n_experts != 0) || (!moe && h->n_experts_used) ||
+	    (moe && (h->n_experts_used < 1 || h->n_experts_used > h->n_experts ||
+	             (uint64_t)3 * h->n_experts > h->n_tensors))) {
+		fprintf(stderr, "hakm: bad expert header (moe flag %d, %u experts, %u used)\n",
+		        moe, h->n_experts, h->n_experts_used);
+		mlf2_close(&c->model); free(c); return NULL;
+	}
+	c->n_experts = (int)h->n_experts; c->n_used = (int)h->n_experts_used;
 
 	c->tok_embd = need(&c->model, "token_embd.weight");
 	c->out_norm = need(&c->model, "output_norm.weight");
@@ -70,7 +93,30 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 		T(wq, "attn_q.weight"); T(wk, "attn_k.weight");
 		T(wv, "attn_v.weight"); T(wo, "attn_output.weight");
 		T(ffn_norm, "ffn_norm.weight");
-		T(gate, "ffn_gate.weight"); T(up, "ffn_up.weight"); T(down, "ffn_down.weight");
+		if (!c->n_experts) { T(gate, "ffn_gate.weight"); T(up, "ffn_up.weight"); T(down, "ffn_down.weight"); }
+		else {
+			/* the dense ffn is the optional shared expert here: all three or none */
+			snprintf(nm, sizeof nm, "blk.%d.ffn_gate.weight", l); L->gate = mlf2_find(&c->model, nm);
+			snprintf(nm, sizeof nm, "blk.%d.ffn_up.weight", l);   L->up   = mlf2_find(&c->model, nm);
+			snprintf(nm, sizeof nm, "blk.%d.ffn_down.weight", l); L->down = mlf2_find(&c->model, nm);
+			if (!L->gate != !L->up || !L->gate != !L->down) {
+				fprintf(stderr, "hakm: layer %d has part of a shared ffn\n", l); ok = 0;
+			}
+			int D = c->d_model, F = c->ffn_dim, E = c->n_experts;
+			snprintf(nm, sizeof nm, "blk.%d.ffn_gate_inp.weight", l);
+			L->router = need(&c->model, nm);
+			ok &= L->router && shaped(L->router, D, E);
+			L->ex = calloc((size_t)3 * E, sizeof *L->ex);
+			if (!L->ex) ok = 0;
+			static const char *const part[3] = { "gate", "up", "down" };
+			for (int e = 0; ok && e < E; e++)
+				for (int j = 0; ok && j < 3; j++) {
+					snprintf(nm, sizeof nm, "blk.%d.ffn_%s.%d.weight", l, part[j], e);
+					const mlf2_tensor *t = need(&c->model, nm);
+					ok &= t && (j < 2 ? shaped(t, D, F) : shaped(t, F, D));
+					L->ex[3 * e + j] = t;
+				}
+		}
 		#undef T
 		/* biases are optional (present for Qwen2) and not error-checked */
 		snprintf(nm, sizeof nm, "blk.%d.attn_q.bias", l); L->bq = mlf2_find(&c->model, nm);
@@ -101,16 +147,20 @@ hakm_ctx *hakm_ctx_new(const char *path, int max_seq) {
 	if (!c->xb || !c->xn || !c->q || !c->k || !c->v || !c->att_out ||
 	    !c->gate_buf || !c->up_buf || !c->deq ||
 	    !c->k_cache || !c->v_cache || !c->logits || !c->att_scores) { hakm_ctx_free(c); return NULL; }
+	/* experts run on the batch rows even for one token, so decode needs them now */
+	if (c->n_experts && batch_scratch(c, 1) != 0) { hakm_ctx_free(c); return NULL; }
 	return c;
 }
 
 void hakm_ctx_free(hakm_ctx *c) {
 	if (!c) return;
+	for (int l = 0; c->layers && l < c->n_layers; l++) free(c->layers[l].ex);
 	free(c->layers); free(c->xb); free(c->xn); free(c->q); free(c->k); free(c->v);
 	free(c->att_out); free(c->gate_buf); free(c->up_buf); free(c->deq);
 	free(c->logits); free(c->k_cache); free(c->v_cache);
 	free(c->bxb); free(c->bxn); free(c->bq); free(c->bk); free(c->bv);
 	free(c->batt); free(c->bgate); free(c->bup); free(c->bscores);
+	free(c->brl); free(c->bxg); free(c->bo); free(c->bgw); free(c->bgg); free(c->bsel); free(c->bidx);
 	free(c->att_scores);
 	mlf2_close(&c->model);
 	free(c);
@@ -249,6 +299,39 @@ static void att_decode_run(void *arg) {
 	att_heads(j->c, j->l, j->pos0, j->q, j->h0, j->h1, j->att, j->scores);
 }
 
+/* the routed experts for n rows of xn (already ffn-normed), added into the
+   residual rows xb. decode and batch both come here (decode is n = 1): router
+   scores, top-k per row, then per expert gather the rows that picked it and
+   run its SwiGLU on just those, scaled by each row's gate. a row picks an
+   expert at most once, so an expert has at most n rows */
+static void moe_ffn(hakm_ctx *c, const layer_t *L, int n, const float *xn, float *xb) {
+	int D = c->d_model, F = c->ffn_dim, E = c->n_experts, K = c->n_used;
+	matmul_batch(c->brl, xn, &c->model, L->router, NULL, E, D, n);
+	for (int r = 0; r < n; r++)
+		topk_gates(c->brl + (size_t)r * E, E, K, c->bsel + (size_t)r * K, c->bgw + (size_t)r * K);
+	for (int e = 0; e < E; e++) {
+		int m = 0;
+		for (int r = 0; r < n; r++)
+			for (int s = 0; s < K; s++) {
+				if (c->bsel[(size_t)r * K + s] != e) continue;
+				c->bidx[m] = r; c->bgg[m] = c->bgw[(size_t)r * K + s];
+				memcpy(c->bxg + (size_t)m * D, xn + (size_t)r * D, D * sizeof(float));
+				m++;
+			}
+		if (!m) continue;
+		const mlf2_tensor *const *X = L->ex + 3 * e;
+		matmul_batch(c->bgate, c->bxg, &c->model, X[0], NULL, F, D, m);
+		matmul_batch(c->bup,   c->bxg, &c->model, X[1], NULL, F, D, m);
+		for (size_t i = 0; i < (size_t)m * F; i++) c->bgate[i] = silu_f(c->bgate[i]) * c->bup[i];
+		matmul_batch(c->bo, c->bgate, &c->model, X[2], NULL, D, F, m);
+		for (int j = 0; j < m; j++) {
+			float *y = xb + (size_t)c->bidx[j] * D, g = c->bgg[j];
+			const float *o = c->bo + (size_t)j * D;
+			for (int i = 0; i < D; i++) y[i] += g * o[i];
+		}
+	}
+}
+
 const float *hakm_forward(hakm_ctx *c, int token) {
 	int D = c->d_model, Q = c->q_dim, H = c->n_heads;
 	int KV = c->kv_dim, F = c->ffn_dim, pos = c->pos;
@@ -304,12 +387,17 @@ const float *hakm_forward(hakm_ctx *c, int token) {
 		/* 2g. ffn rmsnorm */
 		rmsnorm(c->xn, c->xb, fdata(c, L->ffn_norm), D, c->rms_eps);
 
-		/* 2h. SwiGLU */
-		matmul(c->gate_buf, c->xn, &c->model, L->gate, NULL, F, D);
-		matmul(c->up_buf,   c->xn, &c->model, L->up,   NULL, F, D);
-		for (int i = 0; i < F; i++) c->gate_buf[i] = silu_f(c->gate_buf[i]) * c->up_buf[i];
-		matmul(c->xn, c->gate_buf, &c->model, L->down, NULL, D, F);
-		for (int i = 0; i < D; i++) c->xb[i] += c->xn[i];
+		/* 2h. routed experts, before the dense ffn: its down projection overwrites xn */
+		if (c->n_experts) moe_ffn(c, L, 1, c->xn, c->xb);
+
+		/* 2i. SwiGLU (the shared expert in a moe file, when it has one) */
+		if (L->gate) {
+			matmul(c->gate_buf, c->xn, &c->model, L->gate, NULL, F, D);
+			matmul(c->up_buf,   c->xn, &c->model, L->up,   NULL, F, D);
+			for (int i = 0; i < F; i++) c->gate_buf[i] = silu_f(c->gate_buf[i]) * c->up_buf[i];
+			matmul(c->xn, c->gate_buf, &c->model, L->down, NULL, D, F);
+			for (int i = 0; i < D; i++) c->xb[i] += c->xn[i];
+		}
 	}
 
 	/* 3. final norm + lm_head (out_weight == tok_embd when tied, else output.weight) */
@@ -326,6 +414,8 @@ static int batch_scratch(hakm_ctx *c, int cap) {
 	int D = c->d_model, Q = c->q_dim, F = c->ffn_dim, KV = c->kv_dim;
 	free(c->bxb); free(c->bxn); free(c->bq); free(c->bk); free(c->bv);
 	free(c->batt); free(c->bgate); free(c->bup); free(c->bscores);
+	free(c->brl); free(c->bxg); free(c->bo); free(c->bgw); free(c->bgg); free(c->bsel); free(c->bidx);
+	c->brl = c->bxg = c->bo = c->bgw = c->bgg = NULL; c->bsel = c->bidx = NULL;
 	c->bxb  = malloc((size_t)cap * D  * sizeof(float));
 	c->bxn  = malloc((size_t)cap * D  * sizeof(float));
 	c->bq   = malloc((size_t)cap * Q  * sizeof(float));
@@ -337,6 +427,17 @@ static int batch_scratch(hakm_ctx *c, int cap) {
 	c->bscores = malloc((size_t)cap * c->max_seq * sizeof(float));
 	if (!c->bxb || !c->bxn || !c->bq || !c->bk || !c->bv ||
 	    !c->batt || !c->bgate || !c->bup || !c->bscores) { c->batch_cap = 0; return -1; }
+	if (c->n_experts) {
+		int E = c->n_experts, K = c->n_used;
+		c->brl  = malloc((size_t)cap * E * sizeof(float));
+		c->bxg  = malloc((size_t)cap * D * sizeof(float));
+		c->bo   = malloc((size_t)cap * D * sizeof(float));
+		c->bgw  = malloc((size_t)cap * K * sizeof(float));
+		c->bsel = malloc((size_t)cap * K * sizeof(int));
+		c->bgg  = malloc((size_t)cap * sizeof(float));
+		c->bidx = malloc((size_t)cap * sizeof(int));
+		if (!c->brl || !c->bxg || !c->bo || !c->bgw || !c->bsel || !c->bgg || !c->bidx) { c->batch_cap = 0; return -1; }
+	}
 	c->batch_cap = cap;
 	return 0;
 }
@@ -399,7 +500,11 @@ static void batch_layers(hakm_ctx *c, const int *toks, int n) {
 			rmsnorm(c->bxn + (size_t)b * D, c->bxb + (size_t)b * D,
 			        fdata(c, L->ffn_norm), D, c->rms_eps);
 
-		/* 2h. SwiGLU, batched */
+		/* 2h. routed experts, before the dense ffn (it overwrites bxn and bgate) */
+		if (c->n_experts) moe_ffn(c, L, n, c->bxn, c->bxb);
+
+		/* 2i. SwiGLU, batched (the shared expert in a moe file, when it has one) */
+		if (!L->gate) continue;
 		matmul_batch(c->bgate, c->bxn, &c->model, L->gate, NULL, F, D, n);
 		matmul_batch(c->bup,   c->bxn, &c->model, L->up,   NULL, F, D, n);
 		for (int b = 0; b < n; b++) {

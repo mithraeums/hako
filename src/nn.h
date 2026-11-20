@@ -9,6 +9,11 @@ void rmsnorm(float *y, const float *x, const float *w, int n, float eps);
 /* in-place softmax over n elements. */
 void softmax(float *x, int n);
 
+/* expert routing, one function for trainer and engine so a route never differs:
+ * sel[k] = the k largest of z[E] by rank, ties to the lower index; gate[k] =
+ * softmax over just those k (sums to 1). needs 1 <= k <= E. */
+void topk_gates(const float *z, int E, int k, int *sel, float *gate);
+
 /* SiLU(x) = x * sigmoid(x). */
 float silu_f(float x);
 

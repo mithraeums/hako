@@ -28,6 +28,14 @@ CFLAGS  ?= -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -ffast-math -pthread $(A
 LDLIBS  := -lm -lpthread
 
 SRC := src/loader.c src/quant.c src/nn.c src/model.c src/bpe.c src/sample.c src/kvcache.c src/models.c src/quantize.c
+# GPU=1: the matmuls on a GPU through OpenCL, loaded at run time (src/gpu.h).
+# Off by default while it is a spike; the release builds do not change.
+DL := $(if $(filter Linux,$(shell uname -s)),-ldl,)
+ifeq ($(GPU),1)
+  SRC += src/gpu.c
+  CFLAGS += -DHAKM_GPU
+  LDLIBS += $(DL)
+endif
 # embed API source: OPTIONAL in-process library. The hako-code agent does NOT use
 # this — it spawns the `hakm` CLI as a subprocess. Kept for third-party embedders.
 LIB := $(SRC) src/hakm_api.c
@@ -43,10 +51,12 @@ all: hakm
 
 # the trainer: its own binary, so hakm stays the size it is. No -ffast-math:
 # the loop checks the loss for NaN, and fast-math may assume there is none.
-TRAIN_SRC := src/train.c src/nn.c src/quant.c src/loader.c src/bpe.c
+# GPU=1 puts a training run's products on the GPU too (tr_use_gpu in train.h).
+TRAIN_SRC := src/train.c src/iloss.c src/nn.c src/quant.c src/loader.c src/bpe.c
+TRAIN_GPU := $(if $(filter 1,$(GPU)),src/gpu.c -DHAKM_GPU,)
 train: hakm-train
 hakm-train: cli/train.c $(TRAIN_SRC) $(wildcard src/*.h include/*.h)
-	$(CC) -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -ffp-contract=fast -pthread $(ARCH) -o $@ cli/train.c $(TRAIN_SRC) $(LDLIBS)
+	$(CC) -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -ffp-contract=fast -pthread $(ARCH) -o $@ cli/train.c $(TRAIN_SRC) $(TRAIN_GPU) $(LDLIBS)
 
 hakm: cli/main.c $(SRC)
 	@echo "hakm: ARCH=$(if $(ARCH),$(ARCH),none (portable baseline))"
@@ -63,7 +73,7 @@ $(LIBA): $(EMBED_OBJ)
 # Test binaries build into build/, out of the way of the source. `make test_attn`
 # and friends still work: each name is an alias for build/<name>.
 B := build
-TESTS := test_attn test_arch test_train test_quantize test_kvc test_q8 test_load test_quant test_kdot test_api
+TESTS := test_attn test_arch test_train test_iloss test_quantize test_kvc test_q8 test_load test_quant test_kdot test_api
 TCFLAGS = -O1 -g -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -pthread $(SAN)
 
 $(B):
@@ -84,6 +94,12 @@ $(B)/test_arch: tests/test_arch.c src/model.c src/loader.c src/quant.c src/nn.c 
 # the BPE through the engine's encoder, checkpoints. ASan.
 $(B)/test_train: tests/test_train.c $(TRAIN_SRC) src/model.c $(wildcard src/*.h include/*.h) | $(B)
 	$(CC) $(TCFLAGS) $(ARCH) -o $@ tests/test_train.c $(TRAIN_SRC) src/model.c -lm -lpthread
+
+# the integer loss: pinned integers, split windows, close to the float pass,
+# absurd weights scored without an overflow. ASan + UBSan, and $(ARCH) with
+# -ffp-contract=fast, the trainer's flags, under which the pins must still hold.
+$(B)/test_iloss: tests/test_iloss.c $(TRAIN_SRC) $(wildcard src/*.h include/*.h) | $(B)
+	$(CC) $(TCFLAGS) $(ARCH) -ffp-contract=fast -o $@ tests/test_iloss.c $(TRAIN_SRC) -lm -lpthread
 
 # the quantizer against the dequant that defines each block layout. ASan.
 $(B)/test_quantize: tests/test_quantize.c src/quantize.c src/quant.c src/loader.c $(wildcard src/*.h include/*.h) | $(B)
@@ -116,6 +132,14 @@ $(B)/test_kdot: tests/test_kdot.c src/loader.c src/quant.c | $(B)
 $(B)/test_api: tests/test_api.c $(LIB) | $(B)
 	$(CC) $(CFLAGS) -o $@ tests/test_api.c $(LIB) $(LDLIBS)
 
+# the GPU kernels vs dequant and a float dot, every type, batch sizes across the
+# launch split. Skips (passes) on a machine with no OpenCL GPU. Not ASan: the
+# driver's own allocations trip it.
+$(B)/test_gpu: tests/test_gpu.c src/gpu.c src/quantize.c $(TRAIN_SRC) $(wildcard src/*.h include/*.h) | $(B)
+	$(CC) -O1 -g -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -pthread -DHAKM_GPU -o $@ tests/test_gpu.c src/gpu.c src/quantize.c $(TRAIN_SRC) -lm -lpthread $(DL)
+test-gpu: $(B)/test_gpu
+	@$(B)/test_gpu
+
 $(TESTS): %: $(B)/%
 
 # The tests run under ASan+UBSan wherever the compiler can link them. musl
@@ -125,16 +149,17 @@ SAN := $(shell printf 'int main(void){return 0;}\n' | $(CC) -fsanitize=address,u
 # The ASan gates, one command. Built as files, RUN every time: with the run
 # inside the build rule, a second `make test` said "nothing to be done" and
 # tested nothing.
-test: $(B)/test_attn $(B)/test_arch $(B)/test_train $(B)/test_quantize $(B)/test_kvc $(B)/test_q8 $(B)/test_load werror-check
+test: $(B)/test_attn $(B)/test_arch $(B)/test_train $(B)/test_iloss $(B)/test_quantize $(B)/test_kvc $(B)/test_q8 $(B)/test_load werror-check
 	@[ -n "$(SAN)" ] || echo "test: this compiler has no ASan/UBSan — running the tests without them"
-	@$(B)/test_attn && $(B)/test_arch && $(B)/test_train && $(B)/test_quantize && $(B)/test_kvc && $(B)/test_q8 && $(B)/test_load
+	@$(B)/test_attn && $(B)/test_arch && $(B)/test_train && $(B)/test_iloss && $(B)/test_quantize && $(B)/test_kvc && $(B)/test_q8 && $(B)/test_load
 
 # hakm's own sources with the release flags and warnings as errors. the tests
 # build without -ffast-math, so they never saw clang call quantize.c's
 # INFINITY undefined under it (the fallback it guarded could be folded away)
 werror-check:
 	@for f in cli/main.c $(SRC); do $(CC) $(CFLAGS) -Werror -c $$f -o /dev/null || exit 1; done
-	@echo "werror-check: hakm compiles clean with the release flags"
+	@for f in cli/train.c src/train.c src/iloss.c; do $(CC) -O3 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror $(if $(filter 1,$(GPU)),-DHAKM_GPU,) -c $$f -o /dev/null || exit 1; done
+	@echo "werror-check: hakm and hakm-train compile clean with the release flags"
 
 # convert an ollama/HF gguf into our native format
 %.mlf2:
@@ -142,7 +167,7 @@ werror-check:
 
 clean:
 	rm -rf hakm hakm-train $(B) $(LIBA) $(EMBED_OBJ) $(OBJ)
-	rm -rf test_quant test_kdot test_api test_kvc test_attn test_arch test_quantize test_q8 test_load *.dSYM
+	rm -rf test_quant test_kdot test_api test_kvc test_attn test_arch test_iloss test_quantize test_q8 test_load *.dSYM
 
 # The NEON paths, compiled for arm64 with warnings as errors. x86 builds never see that
 # code, and v0.0.4's first tag failed on both ARM builders for a missing include.

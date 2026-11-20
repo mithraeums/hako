@@ -19,7 +19,9 @@ typedef struct {
 	const mlf2_tensor *wq, *wk, *wv, *wo;
 	const mlf2_tensor *bq, *bk, *bv;          /* biases (F32) or NULL */
 	const mlf2_tensor *q_norm, *k_norm;       /* per-head RMSNorm weights [head_dim] or NULL */
-	const mlf2_tensor *gate, *up, *down;
+	const mlf2_tensor *gate, *up, *down;      /* dense ffn; in a moe file the shared expert, or NULL */
+	const mlf2_tensor *router;                /* moe: ffn_gate_inp [E x d_model], else NULL */
+	const mlf2_tensor **ex;                   /* moe: 3E tensors, gate/up/down of expert e at 3e */
 } layer_t;
 
 typedef struct hakm_ctx {
@@ -31,6 +33,7 @@ typedef struct hakm_ctx {
 	int d_model, n_heads, n_kv_heads, head_dim, q_dim, kv_dim, ffn_dim, n_layers, vocab;
 	float rope_theta, rms_eps;
 	int rope_norm;              /* rope pairs (2i, 2i+1), else neox */
+	int n_experts, n_used;      /* routed experts per layer and top-k; 0 = dense */
 
 	int max_seq, pos;            /* KV cache capacity + next write position */
 	hakm_kv_t *k_cache, *v_cache; /* [n_layers * max_seq * kv_dim] each */
@@ -45,6 +48,12 @@ typedef struct hakm_ctx {
 	   max_seq — not by ffn_dim like the gate/up buffers beside it. Sharing
 	   bgate here overflowed the heap on any model whose ffn_dim < ctx. */
 	float *bscores;
+	/* moe rows (sized with the batch scratch, cap >= 1 so decode has them too):
+	   router scores [cap*E], one expert's gathered input and output [cap*D],
+	   each row's experts and gates [cap*k], and for the gathered rows their
+	   source row and gate [cap]. gate/up reuse bgate/bup */
+	float *brl, *bxg, *bo, *bgw, *bgg;
+	int   *bsel, *bidx;
 	int    batch_cap;
 
 	/* per-thread attention score rows for threaded decode attention

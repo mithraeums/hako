@@ -4,6 +4,7 @@
    f16 and q8_0 (their rounding is fixed), within a type's error otherwise, and
    better than the plain min/max grid the scale search is there to beat. */
 #include "../src/quant.h"
+#include "../src/loader.h"
 #include "../include/mlf2.h"
 #include <math.h>
 #include <stdio.h>
@@ -42,6 +43,35 @@ static float naive_q4k(const float *x) {
 		}
 	}
 	return (float)sqrt(e / s);
+}
+
+/* a one-layer moe file: router, an expert gate and an expert down, each 256
+   wide so q4_k fits, all f32 */
+static const char *const MOE_NAMES[3] = { "blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate.0.weight", "blk.0.ffn_down.0.weight" };
+static void write_moe(const char *path, const float *w) {
+	enum { C = 256, R = 2 };
+	mlf2_header h; memset(&h, 0, sizeof h);
+	memcpy(h.magic, MLF2_MAGIC, 4);
+	h.version = MLF2_VERSION; h.arch = MLF2_ARCH_HAKO; h.n_layers = 1; h.d_model = C;
+	h.flags = MLF2_FLAG_TIED_EMBED | MLF2_FLAG_MOE; h.n_experts = 2; h.n_experts_used = 2;
+	h.n_tensors = 3; h.tensors_off = sizeof h;
+	h.tokenizer_off = h.tensors_off + 3 * sizeof(mlf2_tensor);
+	h.data_off = (h.tokenizer_off + 8 + 31) / 32 * 32;
+	FILE *f = fopen(path, "wb");
+	if (!f) return;
+	fwrite(&h, sizeof h, 1, f);
+	for (int i = 0; i < 3; i++) {
+		mlf2_tensor t; memset(&t, 0, sizeof t);
+		snprintf(t.name, sizeof t.name, "%s", MOE_NAMES[i]);
+		t.type = MLF2_TYPE_F32; t.n_dims = 2; t.dims[0] = C; t.dims[1] = R;
+		t.data_off = (uint64_t)i * C * R * 4; t.nbytes = C * R * 4;
+		fwrite(&t, sizeof t, 1, f);
+	}
+	uint32_t z[2] = { 0, 0 };
+	fwrite(z, sizeof z, 1, f);
+	for (long p = ftell(f); p < (long)h.data_off; p++) fputc(0, f);
+	for (int i = 0; i < 3; i++) fwrite(w, 4, C * R, f);
+	fclose(f);
 }
 
 int main(void) {
@@ -92,6 +122,26 @@ int main(void) {
 	ck(rel_rmse(MLF2_TYPE_Q4_K, x, y) != INFINITY && y[0] == 0 && y[N - 1] == 0, "an all-zero tensor stays zero (q4_k)");
 	ck(rel_rmse(MLF2_TYPE_Q6_K, x, y) != INFINITY && y[0] == 0 && y[N - 1] == 0, "an all-zero tensor stays zero (q6_k)");
 	ck(quantize_tensor(MLF2_TYPE_Q4_K, x, b1, 100) == 0, "a size that does not fill whole blocks is refused");
+
+	/* the moe router keeps f32 under q4_k: a rounded score changes which experts
+	   run. its neighbours in the same layer still quantize, by the usual rule */
+	{
+		const char *in = "/tmp/hakm-test-quantize-moe.mlf2", *out = "/tmp/hakm-test-quantize-moe.q4.mlf2";
+		for (int i = 0; i < 512; i++) x[i] = gauss() * 0.02f;
+		write_moe(in, x);
+		hakm_model m;
+		int ok = hakm_quantize(in, out, "q4_k") == 0 && mlf2_open(out, &m) == 0;
+		ck(ok, "a moe file quantizes to q4_k");
+		if (ok) {
+			const mlf2_tensor *r = mlf2_find(&m, MOE_NAMES[0]), *g = mlf2_find(&m, MOE_NAMES[1]), *d = mlf2_find(&m, MOE_NAMES[2]);
+			ck(r && r->type == MLF2_TYPE_F32 && !memcmp(mlf2_data(&m, r), x, 512 * 4), "the router (ffn_gate_inp) stays f32, bit for bit");
+			ck(g && g->type == MLF2_TYPE_Q4_K, "an expert's gate goes to q4_k");
+			ck(d && d->type == MLF2_TYPE_Q6_K, "an expert's down gets the ffn_down q6_k rule");
+			ck(m.h.flags & MLF2_FLAG_MOE && m.h.n_experts == 2 && m.h.n_experts_used == 2, "the expert header survives");
+			mlf2_close(&m);
+		}
+		remove(in); remove(out);
+	}
 
 	free(x); free(y); free(z);
 	printf(fails ? "test_quantize: %d FAILED\n" : "test_quantize: all passed\n", fails);

@@ -2,6 +2,18 @@
 
 All notable changes to the hako engine (`hakm`).
 
+## [v0.0.7] - 2026-11-19
+
+### added
+- **experts**: routed feed-forward experts in the engine, the trainer and the quantizer. `n_experts` and `n_experts_used` in the header and a MOE flag older engines refuse; dense files unchanged byte for byte. top-k routing over a layer's experts, beside an optional shared feed-forward, in decode and batch, through one routing function the engine and the trainer share. the trainer's backward for experts is checked by finite differences on every tensor; `hakm-train --experts --top-k --shared --sticky --balance` (sticky and balance losses on the router). optimizer files are version 2 for models with experts, dense ones stay version 1. the quantizer keeps routers f32
+- **the GPU, opt-in** (`make GPU=1`): the matmuls through OpenCL, loaded at run time and compiled by the driver, weights resident; any error falls back to the CPU, and default builds are unchanged. `hakm-train` trains a dense model on it with weights, grads, moments and activations kept on the device: 10M weights, 16 x 256 tokens a step on a Radeon Pro 555X ran 6,514 tokens a second against 2,484 on its 4-core CPU. `HAKM_GPU_PROF=1` times every kernel. `test_gpu` holds every kernel and a training run's loss and grads to the CPU, and skips without a GPU
+- **`iloss`**: a trainer model's loss in integers, the same to the bit on every machine. int8 weights (a scale a row) times int8 inputs (one power-of-two exponent per 32 values, the MXINT8 layout), int32 sums, a fixed-point norm, rope, softmax, silu and cross-entropy, experts routed by integer scores. about 3e-4 nats from the float pass on a trained model. `test_iloss` pins its integers for dense and expert models, and they hold at -O0, on SSE2 alone, on AVX2 with fused multiply-adds and in wasm32; absurd weights (1e30, inf, NaN, subnormal) score with no overflow under UBSan
+- `tr_set_live`: freeze ranges of the weights for the optimizer, their moments left as they were; `tr_slurp` and `tr_encode` move into the trainer library
+
+### fixed
+- **token positions, step counts, file sizes and GPU arguments were C `long`**, which is 32 bits on wasm32, Windows and 32-bit phones: a corpus past 2^31 tokens or a stride past 2^31 wrapped there. they are 64 bits on every host now
+- zeroing a GPU buffer is a kernel: Apple's `clEnqueueFillBuffer` wrote garbage on the 555X
+
 ## [v0.0.6] - 2026-11-01
 
 v0.0.5 was tagged but never released: its arm64 builds (linux-arm64, macos-universal) failed `make test`. v0.0.6 is v0.0.5 plus the fix below; everything under v0.0.5 ships here.

@@ -203,11 +203,13 @@ size_t quantize_tensor(int type, const float *src, void *dst, int nelem) {
 /* The per-tensor policy for "q4_k" is the usual q4_k_m mix: 1-D tensors stay
    f32, the output projection and the attention-v / ffn-down of some layers
    (first and last eighth, and every third between) get q6_k, the rest q4_k.
-   A row that does not fill whole blocks falls back to q8_0, then f16. */
+   A row that does not fill whole blocks falls back to q8_0, then f16. The
+   moe router (ffn_gate_inp) stays f32 at every type: it is tiny, and a
+   rounded score flips which experts a token runs, not just a little error. */
 static int more_bits(int l, int n) { return l < n / 8 || l >= 7 * n / 8 || (l - n / 8) % 3 == 2; }
 
 static int pick_type(const mlf2_header *h, const mlf2_tensor *t, int want) {
-	if (t->n_dims < 2) return MLF2_TYPE_F32;
+	if (t->n_dims < 2 || strstr(t->name, "ffn_gate_inp.")) return MLF2_TYPE_F32;
 	int type = want, l = -1;
 	if (want == MLF2_TYPE_Q4_K) {
 		int tied = (h->flags & MLF2_FLAG_TIED_EMBED) != 0;

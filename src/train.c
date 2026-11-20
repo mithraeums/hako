@@ -7,16 +7,26 @@
  * row-major, so the three products of a linear layer need no transposed
  * reads: the forward reads a transposed copy of the weights (refreshed after
  * each update), dX reads W as stored, dW reads dY transposed through strides.
+ *
+ * A moe ffn runs the same products on rows grouped by expert: the picks are
+ * counted into one order per layer, each expert's rows gathered there, and its
+ * three products run on just those rows (a shared ffn takes the first N rows).
  */
+#define _FILE_OFFSET_BITS 64   /* off_t is 64 bits on 32-bit hosts too (tr_slurp) */
 #include "train.h"
 #include "nn.h"
 #include "loader.h"
 #include "../include/mlf2.h"
+#include "bpe.h"
+#ifdef HAKM_GPU
+#include "gpu.h"
+#endif
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 typedef float v8 __attribute__((vector_size(32)));
 typedef float v8u __attribute__((vector_size(32), aligned(4)));
@@ -47,8 +57,17 @@ static inline v8 vexp(v8 x) {
 static inline float hsum(v8 s) { return ((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7])); }
 
 typedef struct { char name[MLF2_MAX_NAME]; size_t off; int rows, cols; } tr_tensor;
-/* what the backward needs of one layer's forward, [rows][width] each */
-typedef struct { float *x, *xn1, *r1, *q, *k, *v, *p, *ao, *xm, *xn2, *r2, *g, *u, *h; } tr_acts;
+/* what the backward needs of one layer's forward, [rows][width] each. g, u, h
+   hold the ffn rows, the shared ffn's N first, then every pick grouped by
+   expert. moe: xg the picks' gathered inputs and o their outputs [N*k][dim],
+   pi the router's full softmax [N][E], gw the gates [N][k]; ints sel the picks
+   by rank and row each pick's grouped row [N][k], eoff expert e's rows
+   [eoff[e], eoff[e+1]) */
+typedef struct {
+	float *x, *xn1, *r1, *q, *k, *v, *p, *ao, *xm, *xn2, *r2, *g, *u, *h;
+	float *xg, *o, *pi, *gw;
+	int *sel, *row, *eoff;
+} tr_acts;
 
 struct tr_model {
 	tr_config c;
@@ -57,7 +76,8 @@ struct tr_model {
 	int nt; tr_tensor *t;
 	float *p, *g, *mo, *ve, *pt;     /* params, grads, adam moments, transposed matrices */
 	int pt_ok;
-	long step;
+	int64_t step;
+	size_t *live; int nlive;        /* tr_set_live's ranges, off then len each; NULL = every weight */
 	float *cs, *sn;                  /* rope tables [ctx][head_dim/2] */
 	float *dwp;                      /* per-thread norm weight grads [MAXT][dim] */
 
@@ -65,16 +85,35 @@ struct tr_model {
 	size_t ws_n;                     /* per-thread attention scratch, floats */
 	void *scr_raw;
 	float *act;
+	int *iact;                       /* the moe ints of every layer */
 	tr_acts *a;
 	float *xL, *xf, *rf, *lg;
 	float *dx, *dxn, *dao, *dq, *dk, *dv, *dA, *dB, *scr;
+	float *dxg, *dz;                 /* moe: d(picked rows) [N*k][dim], d(router scores) [N][E] */
+	float lam_s, lam_b;              /* aux weights, sticky and balance */
+	double aux;                      /* their value in the last run */
+	void *dev;                       /* the device copy (HAKM_GPU builds, dense models) */
+	int where;                       /* which copy of p, g, mo, ve is newest: 0 host, 1 device, 2 both */
 };
 
 const tr_config *tr_cfg(const tr_model *m) { return &m->c; }
 size_t tr_n_params(const tr_model *m) { return m->n; }
-float *tr_params(tr_model *m) { m->pt_ok = 0; return m->p; }
-float *tr_grads(tr_model *m) { return m->g; }
-long  *tr_step(tr_model *m) { return &m->step; }
+static void to_host(tr_model *m);
+static void host_dirty(tr_model *m) { if (m->dev) m->where = 0; }
+/* the caller may write either: the host copy is the newest after this */
+float *tr_params(tr_model *m) { to_host(m); host_dirty(m); m->pt_ok = 0; return m->p; }
+float *tr_grads(tr_model *m) { to_host(m); host_dirty(m); return m->g; }
+int64_t *tr_step(tr_model *m) { return &m->step; }
+void tr_set_aux(tr_model *m, float sticky, float balance) { m->lam_s = sticky; m->lam_b = balance; }
+double tr_aux(const tr_model *m) { return m->c.experts ? m->aux : 0; }
+const int *tr_routes(const tr_model *m, int layer) {
+	return m->c.experts && m->iact && layer >= 0 && layer < m->c.layers ? m->a[layer].sel : NULL;
+}
+size_t tr_expert_off(const tr_model *m, int l, int e) {
+	const tr_config *c = &m->c;
+	if (l < 0 || l >= c->layers || e < 0 || e >= c->experts) return SIZE_MAX;
+	return m->L[l].experts + (size_t)e * 3 * c->ffn * c->dim;
+}
 
 /* ── matrix product ───────────────────────────────────────────────────────── */
 
@@ -182,8 +221,28 @@ static void gemm_rows(void *arg) {
 	}
 }
 
+/* the GPU takes a training run's products (tr_run with a grad scale) from this
+   size up, in M x N x K; a forward pass alone stays on the CPU (train.h) */
+static int gpu_on = 1, gpu_now;
+void tr_use_gpu(int on) { gpu_on = on; }
+#ifdef HAKM_GPU
+const char *tr_gpu_name(void) { return gpu_on ? gpu_name() : NULL; }
+#else
+const char *tr_gpu_name(void) { return NULL; }
+#endif
+#ifdef HAKM_GPU
+static double gpu_min(void) {
+	static double v = -1;
+	if (v < 0) { const char *e = getenv("HAKM_GPU_MIN"); v = e ? atof(e) : 1 << 24; }
+	return v;
+}
+#endif
+
 static void gemm(int M, int N, int K, const float *A, size_t sm, size_t sk,
                  const float *B, size_t ldb, float *C, size_t ldc, int add) {
+#ifdef HAKM_GPU
+	if (gpu_now && (double)M * N * K >= gpu_min() && !gpu_gemm(M, N, K, A, sm, sk, B, ldb, C, ldc, add)) return;
+#endif
 	int np = (N + NR - 1) / NR, T = hakm_nthreads();
 	if (T > MAXT) T = MAXT;
 	size_t bsz = (size_t)np * K * NR, need = bsz + (size_t)T * MC * KC;
@@ -255,7 +314,16 @@ const char *tr_check(const tr_config *c) {
 	if (c->heads % c->kv_heads) return "heads must be a multiple of kv-heads";
 	if (c->head_dim % 8) return "head_dim (dim / heads) must be a multiple of 8";
 	if (c->dim % 8 || c->ffn % 8) return "dim and ffn must be multiples of 8";
+	if (c->experts < 0 || c->experts == 1 || c->experts > 1024) return "experts must be 0 (dense) or 2 to 1024";
+	/* k = 1 gives the router no gradient from the loss: its one gate is always 1 */
+	if (c->experts && (c->top_k < 2 || c->top_k > c->experts || c->top_k > 8)) return "top-k must be 2 to min(experts, 8)";
+	if (c->experts && (c->shared < 0 || c->shared > 1)) return "shared must be 0 or 1";
 	return NULL;
+}
+
+/* ffn rows per token: the dense (or shared) ffn's, then one per pick */
+static size_t ffn_rows(const tr_config *c) {
+	return (size_t)(!c->experts || c->shared) + (size_t)(c->experts ? c->top_k : 0);
 }
 
 static uint64_t splitmix(uint64_t *s) {
@@ -282,9 +350,12 @@ static tr_model *tr_alloc(const tr_config *c) {
 	tr_model *m = calloc(1, sizeof *m);
 	if (!m) return NULL;
 	m->c = *c;
+	if (!c->experts) m->c.top_k = m->c.shared = 0;   /* dense, whatever they said */
 	int D = c->dim, Q = c->heads * c->head_dim, KV = c->kv_heads * c->head_dim, F = c->ffn, V = c->vocab;
+	int E = c->experts, sh = !E || c->shared;
+	m->lam_b = 0.01f;
 	m->L = calloc(c->layers, sizeof *m->L);
-	m->t = calloc(2 + 9 * (size_t)c->layers, sizeof *m->t);
+	m->t = calloc(2 + (size_t)c->layers * (9 + (E > 0) + 3 * (size_t)E), sizeof *m->t);
 	if (!m->L || !m->t) { tr_free(m); return NULL; }
 	size_t at = 0;
 	char nm[64];
@@ -296,10 +367,21 @@ static tr_model *tr_alloc(const tr_config *c) {
 		T(wq, "attn_q.weight", Q, D); T(wk, "attn_k.weight", KV, D); T(wv, "attn_v.weight", KV, D);
 		T(wo, "attn_output.weight", D, Q);
 		T(ffn_norm, "ffn_norm.weight", 1, D);
-		T(gate, "ffn_gate.weight", F, D); T(up, "ffn_up.weight", F, D); T(down, "ffn_down.weight", D, F);
+		if (E) { T(router, "ffn_gate_inp.weight", E, D); }
+		if (sh) { T(gate, "ffn_gate.weight", F, D); T(up, "ffn_up.weight", F, D); T(down, "ffn_down.weight", D, F); }
 		#undef T
 	}
 	m->out_norm = add_tensor(m, &at, "output_norm.weight", 1, D);
+	/* the routed experts after everything dense: (l, e) one range each */
+	static const char *const part[3] = { "gate", "up", "down" };
+	for (int l = 0; l < c->layers; l++) {
+		m->L[l].experts = at;
+		for (int e = 0; e < E; e++)
+			for (int j = 0; j < 3; j++) {
+				snprintf(nm, sizeof nm, "blk.%d.ffn_%s.%d.weight", l, part[j], e);
+				add_tensor(m, &at, nm, j < 2 ? F : D, j < 2 ? D : F);
+			}
+	}
 	m->n = at;
 	m->p  = calloc(at, sizeof(float)); m->g  = calloc(at, sizeof(float));
 	m->mo = calloc(at, sizeof(float)); m->ve = calloc(at, sizeof(float));
@@ -338,26 +420,31 @@ tr_model *tr_new(const tr_config *c, uint64_t seed) {
 }
 
 static void free_acts(tr_model *m) {
-	free(m->act); free(m->a); free(m->scr_raw);
-	m->act = NULL; m->a = NULL; m->scr = NULL; m->scr_raw = NULL; m->capB = m->capT = 0;
+	free(m->act); free(m->iact); free(m->a); free(m->scr_raw);
+	m->act = NULL; m->iact = NULL; m->a = NULL; m->scr = NULL; m->scr_raw = NULL; m->capB = m->capT = 0;
 }
 
+static void dev_free(tr_model *m);
 void tr_free(tr_model *m) {
 	if (!m) return;
+	dev_free(m);
 	free_acts(m);
 	free(m->L); free(m->t);
 	free(m->p); free(m->g); free(m->mo); free(m->ve); free(m->pt);
-	free(m->cs); free(m->sn); free(m->dwp);
+	free(m->cs); free(m->sn); free(m->dwp); free(m->live);
 	free(m);
 	free(gm_raw); gm_raw = gm_buf = NULL; gm_cap = 0;
 }
 
-/* floats: activations per layer and after the layers, and attention scratch per thread */
-static void act_sizes(const tr_config *c, int B, int T, size_t *per_layer, size_t *tail, size_t *ws_n) {
+/* floats: activations per layer and after the layers, and attention scratch per
+   thread; ints, the moe picks of every layer */
+static void act_sizes(const tr_config *c, int B, int T, size_t *per_layer, size_t *tail, size_t *ws_n, size_t *ints) {
 	size_t N = (size_t)B * T, D = c->dim, Q = (size_t)c->heads * c->head_dim;
-	size_t KV = (size_t)c->kv_heads * c->head_dim, F = c->ffn, V = c->vocab;
-	*per_layer = N * (4 * D + 2 + 2 * Q + 2 * KV + 3 * F) + (size_t)B * c->heads * T * T;
-	*tail = N * (2 * D + 1 + V) + N * (2 * D + 2 * Q + 2 * KV + 2 * F);
+	size_t KV = (size_t)c->kv_heads * c->head_dim, F = c->ffn, V = c->vocab, R = N * ffn_rows(c);
+	size_t E = c->experts, K = E ? c->top_k : 0;
+	*per_layer = N * (4 * D + 2 + 2 * Q + 2 * KV) + 3 * R * F + (size_t)B * c->heads * T * T + N * (2 * K * D + E + K);
+	*tail = N * (2 * D + 1 + V) + N * (2 * D + 2 * Q + 2 * KV) + 2 * R * F + N * (K * D + E);
+	*ints = E ? c->layers * (2 * N * K + E + 1) : 0;
 	size_t hd = c->head_dim, Tp = (T + 15) / 16 * 16, Hp = (hd + 15) / 16 * 16, Tq = ((size_t)T * T + 15) / 16 * 16;
 	size_t w = Tq + (Tp * hd > Hp * T ? Tp * hd : Hp * T) + MR * ((size_t)T > hd ? (size_t)T : hd) + 16;
 	*ws_n = (w + 15) / 16 * 16;
@@ -365,12 +452,13 @@ static void act_sizes(const tr_config *c, int B, int T, size_t *per_layer, size_
 
 size_t tr_mem_bytes(const tr_config *c, int B, int T) {
 	size_t D = c->dim, Q = (size_t)c->heads * c->head_dim, KV = (size_t)c->kv_heads * c->head_dim;
-	size_t F = c->ffn, V = c->vocab, N = (size_t)B * T, per_layer, tail, ws, th = hakm_nthreads();
-	size_t np = V * D + c->layers * (2 * D + 2 * Q * D + 2 * KV * D + 3 * F * D) + D;
-	act_sizes(c, B, T, &per_layer, &tail, &ws);
+	size_t F = c->ffn, V = c->vocab, N = (size_t)B * T, per_layer, tail, ws, ints, th = hakm_nthreads();
+	size_t E = c->experts, sh = !E || c->shared;
+	size_t np = V * D + c->layers * (2 * D + 2 * Q * D + 2 * KV * D + sh * 3 * F * D + E * D + E * 3 * F * D) + D;
+	act_sizes(c, B, T, &per_layer, &tail, &ws, &ints);
 	size_t wide = F > Q ? F : Q, packed = N * (wide > D ? wide : D);   /* the widest B a product packs */
 	if (V * D > packed) packed = V * D;
-	return (5 * np + per_layer * c->layers + tail + th * ws + packed + th * MC * KC) * sizeof(float);
+	return (5 * np + per_layer * c->layers + tail + th * ws + packed + th * MC * KC) * sizeof(float) + ints * sizeof(int);
 }
 
 static int ensure_acts(tr_model *m, int B, int T) {
@@ -380,12 +468,14 @@ static int ensure_acts(tr_model *m, int B, int T) {
 	free_acts(m);
 	const tr_config *c = &m->c;
 	size_t N = (size_t)B * T, D = c->dim, Q = (size_t)c->heads * c->head_dim;
-	size_t KV = (size_t)c->kv_heads * c->head_dim, F = c->ffn, V = c->vocab, per_layer, tail;
-	act_sizes(c, B, T, &per_layer, &tail, &m->ws_n);
+	size_t KV = (size_t)c->kv_heads * c->head_dim, F = c->ffn, V = c->vocab, per_layer, tail, ints;
+	size_t E = c->experts, K = E ? c->top_k : 0, R = N * ffn_rows(c);
+	act_sizes(c, B, T, &per_layer, &tail, &m->ws_n, &ints);
 	m->act = malloc((per_layer * c->layers + tail) * sizeof(float));
+	m->iact = ints ? calloc(ints, sizeof(int)) : NULL;
 	m->a = calloc(c->layers, sizeof *m->a);
 	m->scr = alloc64((size_t)hakm_nthreads() * m->ws_n, &m->scr_raw);
-	if (!m->act || !m->a || !m->scr) { free_acts(m); return -1; }
+	if (!m->act || (ints && !m->iact) || !m->a || !m->scr) { free_acts(m); return -1; }
 	float *p = m->act;
 	#define TAKE(dst, n) do { (dst) = p; p += (n); } while (0)
 	for (int l = 0; l < c->layers; l++) {
@@ -393,11 +483,17 @@ static int ensure_acts(tr_model *m, int B, int T) {
 		TAKE(m->a[l].q, N * Q); TAKE(m->a[l].k, N * KV); TAKE(m->a[l].v, N * KV);
 		TAKE(m->a[l].p, (size_t)B * c->heads * T * T); TAKE(m->a[l].ao, N * Q);
 		TAKE(m->a[l].xm, N * D); TAKE(m->a[l].xn2, N * D); TAKE(m->a[l].r2, N);
-		TAKE(m->a[l].g, N * F); TAKE(m->a[l].u, N * F); TAKE(m->a[l].h, N * F);
+		TAKE(m->a[l].g, R * F); TAKE(m->a[l].u, R * F); TAKE(m->a[l].h, R * F);
+		if (E) { TAKE(m->a[l].xg, N * K * D); TAKE(m->a[l].o, N * K * D); TAKE(m->a[l].pi, N * E); TAKE(m->a[l].gw, N * K); }
 	}
 	TAKE(m->xL, N * D); TAKE(m->xf, N * D); TAKE(m->rf, N); TAKE(m->lg, N * V);
 	TAKE(m->dx, N * D); TAKE(m->dxn, N * D); TAKE(m->dao, N * Q); TAKE(m->dq, N * Q);
-	TAKE(m->dk, N * KV); TAKE(m->dv, N * KV); TAKE(m->dA, N * F); TAKE(m->dB, N * F);
+	TAKE(m->dk, N * KV); TAKE(m->dv, N * KV); TAKE(m->dA, R * F); TAKE(m->dB, R * F);
+	if (E) { TAKE(m->dxg, N * K * D); TAKE(m->dz, N * E); }
+	if (E) {   /* the same cut, of the ints */
+		int *p = m->iact;
+		for (int l = 0; l < c->layers; l++) { TAKE(m->a[l].sel, N * K); TAKE(m->a[l].row, N * K); TAKE(m->a[l].eoff, E + 1); }
+	}
 	#undef TAKE
 	m->capB = B; m->capT = T;
 	return 0;
@@ -464,11 +560,76 @@ static void rope_rows(const tr_model *m, float *x, int n0, int n1, int T, int nh
 /* the per-row passes over a range of rows, split across the threads:
    0 x += xa (when given), then out = rmsnorm(x) * w with r the 1/rms;
    1 the rmsnorm backward into out (dx) and this thread's dw partial;
-   2 rope on x, nh heads, dir +1 forward or -1 backward */
+   2 rope on x, nh heads, dir +1 forward or -1 backward;
+   3.. layer l's experts, one token a row (moe_rows) */
 typedef struct {
-	int op; const tr_model *m; int i0, i1, T, nh, dir;
+	int op; const tr_model *m; int i0, i1, T, nh, dir, l;
 	float *out, *r, *x, *dw; const float *xa, *w, *dy;
+	float scale;
 } vec_job;
+
+/* the moe passes, a token a row:
+   3 route: top-k of the router scores and their gates (topk_gates, the
+     engine's), then the scores turned into the full softmax pi in place;
+   4 gather: the row's ffn input copied to each of its picks' grouped rows;
+   5 combine: out (the shared ffn's output, else zeros) += gate * expert output;
+   6 gates backward, dy the output's gradient: a_s = <dy, o_s>, d o_s = g_s dy
+     into dxg, dz_j = g_j (a_j - sum g_s a_s) on the picks, then the aux
+     losses' dz on every score (scaled like the loss);
+   7 scatter: the picks' input gradients summed into the row's dxn */
+static void moe_rows(const vec_job *j) {
+	const tr_model *m = j->m;
+	const tr_acts *a = &m->a[j->l];
+	int D = m->c.dim, E = m->c.experts, K = m->c.top_k;
+	for (int n = j->i0; n < j->i1; n++) {
+		int *sel = a->sel + (size_t)n * K;
+		const int *row = a->row + (size_t)n * K;
+		float *gw = a->gw + (size_t)n * K, *pi = a->pi + (size_t)n * E;
+		if (j->op == 3) { topk_gates(pi, E, K, sel, gw); softmax(pi, E); }
+		else if (j->op == 4)
+			for (int s = 0; s < K; s++) memcpy(a->xg + (size_t)row[s] * D, a->xn2 + (size_t)n * D, D * sizeof(float));
+		else if (j->op == 5) {
+			float *y = j->out + (size_t)n * D;
+			if (!m->c.shared) memset(y, 0, D * sizeof(float));
+			for (int s = 0; s < K; s++) {
+				const float *o = a->o + (size_t)row[s] * D;
+				for (int i = 0; i < D; i++) y[i] += gw[s] * o[i];
+			}
+		} else if (j->op == 6) {
+			const float *dy = j->dy + (size_t)n * D;
+			float as[8], sum = 0, *dz = m->dz + (size_t)n * E;
+			for (int s = 0; s < K; s++) {
+				const float *o = a->o + (size_t)row[s] * D;
+				float *d = m->dxg + (size_t)row[s] * D, dot = 0;
+				for (int i = 0; i < D; i++) { dot += dy[i] * o[i]; d[i] = gw[s] * dy[i]; }
+				as[s] = dot; sum += gw[s] * dot;
+			}
+			memset(dz, 0, E * sizeof(float));
+			for (int s = 0; s < K; s++) dz[sel[s]] = gw[s] * (as[s] - sum);
+			/* sticky: d(-ls M)/dz_j = -ls pi_j (1[j in prev] - M), M = pi on the previous token's picks */
+			float ls = j->scale * m->lam_s, lb = j->scale * m->lam_b * E;
+			if (ls != 0 && n % j->T) {
+				const int *prev = sel - K;
+				float M = 0;
+				for (int s = 0; s < K; s++) M += pi[prev[s]];
+				for (int e = 0; e < E; e++) dz[e] += ls * pi[e] * M;
+				for (int s = 0; s < K; s++) dz[prev[s]] -= ls * pi[prev[s]];
+			}
+			/* balance: d(lb sum_e f_e pi_e)/dz_j = lb pi_j (f_j - sum_e f_e pi_e), f_e expert e's share of the picks */
+			if (lb != 0) {
+				float inv = 1.0f / (float)a->eoff[E], fp = 0;
+				for (int e = 0; e < E; e++) fp += (float)(a->eoff[e + 1] - a->eoff[e]) * inv * pi[e];
+				for (int e = 0; e < E; e++) dz[e] += lb * pi[e] * ((float)(a->eoff[e + 1] - a->eoff[e]) * inv - fp);
+			}
+		} else {
+			float *d = m->dxn + (size_t)n * D;
+			for (int s = 0; s < K; s++) {
+				const float *g = m->dxg + (size_t)row[s] * D;
+				for (int i = 0; i < D; i++) d[i] += g[i];
+			}
+		}
+	}
+}
 
 static void vec_rows(void *arg) {
 	vec_job *j = arg;
@@ -480,7 +641,8 @@ static void vec_rows(void *arg) {
 	} else if (j->op == 1) {
 		memset(j->dw, 0, D * sizeof(float));
 		rms_bwd(j->out + o, j->dw, j->dy + o, j->x + o, j->r + j->i0, j->w, n, D);
-	} else rope_rows(j->m, j->x, j->i0, j->i1, j->T, j->nh, j->dir);
+	} else if (j->op == 2) rope_rows(j->m, j->x, j->i0, j->i1, j->T, j->nh, j->dir);
+	else moe_rows(j);
 }
 
 static void vec_par(vec_job v, int N) {
@@ -511,6 +673,38 @@ static void rms_back(const tr_model *m, float *dx, float *dw, const float *dy, c
 }
 static void rope_par(const tr_model *m, float *x, int N, int T, int nh, int dir) {
 	vec_par((vec_job){ .op = 2, .m = m, .x = x, .T = T, .nh = nh, .dir = dir }, N);
+}
+static void moe_par(const tr_model *m, int op, int l, int N, int T, float *out, const float *dy, float scale) {
+	vec_par((vec_job){ .op = op, .m = m, .l = l, .T = T, .out = out, .dy = dy, .scale = scale }, N);
+}
+
+/* route layer l's N rows (ffn-normed in xn2): the router's scores, each row's
+   picks and gates, then the picks grouped by expert with one serial counting
+   sort (an expert's rows keep token order) and the rows gathered there. adds
+   the aux losses' value: they need the whole batch's loads */
+static void moe_route(tr_model *m, int l, int N, int T) {
+	tr_acts *a = &m->a[l];
+	int E = m->c.experts, K = m->c.top_k, NK = N * K, *eo = a->eoff;
+	mm_fwd(a->pi, a->xn2, m->pt + m->L[l].router, N, E, m->c.dim);
+	moe_par(m, 3, l, N, T, NULL, NULL, 0);
+	memset(eo, 0, (E + 1) * sizeof(int));
+	for (int i = 0; i < NK; i++) eo[a->sel[i] + 1]++;
+	for (int e = 0; e < E; e++) eo[e + 1] += eo[e];
+	for (int i = 0; i < NK; i++) a->row[i] = eo[a->sel[i]]++;
+	for (int e = E; e > 0; e--) eo[e] = eo[e - 1];
+	eo[0] = 0;
+	double st = 0, bal = 0;
+	if (m->lam_s != 0)
+		for (int n = 0; n < N; n++)
+			for (int s = 0; n % T && s < K; s++) st += a->pi[(size_t)n * E + a->sel[(size_t)(n - 1) * K + s]];
+	if (m->lam_b != 0)
+		for (int e = 0; e < E; e++) {
+			double col = 0;
+			for (int n = 0; n < N; n++) col += a->pi[(size_t)n * E + e];
+			bal += (double)(eo[e + 1] - eo[e]) / NK * col;
+		}
+	m->aux += -(double)m->lam_s * st + (double)m->lam_b * E * bal;
+	moe_par(m, 4, l, N, T, NULL, NULL, 0);
 }
 
 typedef struct {
@@ -650,14 +844,275 @@ static void ce_rows(void *arg) {
 	j->out = nll;
 }
 
+/* ── the same run on the GPU ─────────────────────────────────────────────────
+
+   A dense model trained with HAKM_GPU keeps p, g, mo, ve and every activation on
+   the device, in the host's own layout (an activation is its offset from
+   m->act), so a step moves only the token ids up and the rows' losses down.
+   m->where says which copy is newest; whatever reads or writes the host's
+   (tr_params, tr_grads, the files, a CPU run) brings it home first. A moe model,
+   or one whose activations pass what one device buffer may be, trains on the CPU
+   with its products offloaded one by one (gemm above). */
+#ifdef HAKM_GPU
+typedef struct {
+	gpu_mem *p, *g, *mo, *ve, *ids, *ds, *rope, *part;
+	gpu_mem **act; size_t *base;     /* the activations a buffer a layer, then one for the tail (one may not hold them all) */
+	int nact, B, T;
+	int *host, *cnt;                 /* the ids going up [6N + 2], counts per token [V] */
+	float *nll;                      /* the rows' losses coming down [N] */
+} tr_dev;
+
+static void dev_acts_free(tr_dev *d) {
+	for (int i = 0; i < d->nact; i++) gpu_del(d->act[i]);
+	gpu_del(d->ids); gpu_del(d->ds); gpu_del(d->part);
+	free(d->act); free(d->base); free(d->host); free(d->nll);
+	d->act = NULL; d->base = NULL; d->nact = 0;
+	d->ids = d->ds = d->part = NULL; d->host = NULL; d->nll = NULL; d->B = d->T = 0;
+}
+/* an activation's buffer and offset there, from where it sits in m->act */
+static gpu_arg dev_act(const tr_model *m, const tr_dev *d, const float *at) {
+	size_t o = (size_t)(at - m->act);
+	int r = d->nact - 1;
+	while (r > 0 && o < d->base[r]) r--;
+	return GP(d->act[r], o - d->base[r]);
+}
+static void dev_free(tr_model *m) {
+	tr_dev *d = m->dev;
+	if (!d) return;
+	dev_acts_free(d);
+	gpu_del(d->p); gpu_del(d->g); gpu_del(d->mo); gpu_del(d->ve); gpu_del(d->rope);
+	free(d->cnt); free(d);
+	m->dev = NULL; m->where = 0;
+}
+static int dev_move(tr_model *m, int up) {
+	tr_dev *d = m->dev;
+	size_t b = m->n * sizeof(float);
+	float *h[4] = { m->p, m->g, m->mo, m->ve };
+	gpu_mem *g[4] = { d->p, d->g, d->mo, d->ve };
+	for (int i = 0; i < 4; i++) if (up ? gpu_put(g[i], 0, h[i], b) : gpu_get(g[i], 0, h[i], b)) return -1;
+	return 0;
+}
+static void to_host(tr_model *m) {
+	if (!m->dev || m->where != 1) return;
+	if (dev_move(m, 0)) { fprintf(stderr, "train: the weights could not come back from the GPU\n"); return; }
+	m->where = 2; m->pt_ok = 0;
+}
+/* the device copy at the host's capacity (ensure_acts first), the newest state on it; NULL = the CPU */
+static tr_dev *dev_ready(tr_model *m) {
+	const tr_config *c = &m->c;
+	tr_dev *d = m->dev;
+	size_t N = (size_t)m->capB * m->capT, D = c->dim, half = c->head_dim / 2, b = m->n * sizeof(float);
+	if (!d) {
+		if (!(d = calloc(1, sizeof *d))) return NULL;
+		m->dev = d; m->where = 0;
+		float *rt = malloc((size_t)c->ctx * half * 2 * sizeof(float));
+		d->p = gpu_new(b); d->g = gpu_new(b); d->mo = gpu_new(b); d->ve = gpu_new(b);
+		d->rope = gpu_new((size_t)c->ctx * half * 2 * sizeof(float));
+		d->cnt = malloc((size_t)c->vocab * sizeof(int));
+		if (rt) { memcpy(rt, m->cs, (size_t)c->ctx * half * sizeof(float)); memcpy(rt + (size_t)c->ctx * half, m->sn, (size_t)c->ctx * half * sizeof(float)); }
+		int bad = !rt || !d->p || !d->g || !d->mo || !d->ve || !d->rope || !d->cnt ||
+		          gpu_put(d->rope, 0, rt, (size_t)c->ctx * half * 2 * sizeof(float));
+		free(rt);
+		if (bad) { dev_free(m); return NULL; }
+	}
+	if (d->B != m->capB || d->T != m->capT) {
+		dev_acts_free(d);
+		size_t per_layer, tail, ws, ints;
+		act_sizes(c, m->capB, m->capT, &per_layer, &tail, &ws, &ints);
+		size_t na = per_layer * c->layers + tail, nb = (N + 127) / 128;
+		int nr = c->layers + 1, ok = 1;
+		d->act = calloc(nr, sizeof *d->act); d->base = calloc(nr, sizeof *d->base);
+		if (d->act && d->base) {
+			d->nact = nr;
+			for (int r = 0; r < nr; r++) {
+				d->base[r] = (size_t)((r < c->layers ? m->a[r].x : m->xL) - m->act);
+				if (!(d->act[r] = gpu_new((r < c->layers ? per_layer : tail) * sizeof(float)))) ok = 0;
+			}
+		} else ok = 0;
+		d->ids = gpu_new((6 * N + 2) * sizeof(int));
+		d->ds = gpu_new((size_t)m->capB * c->heads * m->capT * m->capT * sizeof(float));
+		d->part = gpu_new(nb * D * sizeof(float));
+		d->host = malloc((6 * N + 2) * sizeof(int)); d->nll = malloc(N * sizeof(float));
+		if (!ok || !d->ids || !d->ds || !d->part || !d->host || !d->nll) {
+			static int said;
+			if (!said++) fprintf(stderr, "train: %zu MB of activations do not fit the GPU's buffers, the CPU trains\n", (na * sizeof(float)) >> 20);
+			to_host(m); dev_free(m); return NULL;
+		}
+		d->B = m->capB; d->T = m->capT;
+	}
+	if (m->where == 0) { if (dev_move(m, 1)) { dev_free(m); return NULL; } m->where = 2; }
+	return d;
+}
+
+#define LA(k, gx, gy, ...) do { gpu_arg a_[] = { __VA_ARGS__ }; if (gpu_launch(k, gx, gy, 1, (int)(sizeof a_ / sizeof *a_), a_)) return -1; } while (0)
+/* a batch of products over (sequence, head), gpu.h's GK_GEMM: nz = sequences x zh,
+   bs[3][3] = each operand's per-sequence stride, per-head stride and head divisor */
+static int bgemm(gpu_arg C, gpu_arg A, gpu_arg B, int M, int N, int K, int sam, int sak, int sbk, int sbn, int ldc, int add,
+                 int nz, int zh, int hm, int h0, const int64_t bs[3][3]) {
+	gpu_arg a[] = { A, B, C, GI(M), GI(N), GI(K), GI(sam), GI(sak), GI(sbk), GI(sbn), GI(ldc), GI(add),
+	                GI(zh), GI(hm), GI(h0), GL(bs[0][0]), GL(bs[0][1]), GI(bs[0][2]), GL(bs[1][0]), GL(bs[1][1]), GI(bs[1][2]),
+	                GL(bs[2][0]), GL(bs[2][1]), GI(bs[2][2]) };
+	return gpu_launch(GK_GEMM, (size_t)(N + 63) / 64 * 16, (size_t)(M + 63) / 64 * 16, (size_t)nz, (int)(sizeof a / sizeof *a), a);
+}
+/* C[M,N] (+)= op(A) op(B), the strides as the kernel takes them (gpu.c) */
+static int dgemm(gpu_arg C, gpu_arg A, gpu_arg B, int M, int N, int K, int sam, int sak, int sbk, int sbn, int add) {
+	static const int64_t one[3][3] = { { 0, 0, 1 }, { 0, 0, 1 }, { 0, 0, 1 } };
+	return bgemm(C, A, B, M, N, K, sam, sak, sbk, sbn, N, add, 1, 1, 1, 0, one);
+}
+/* the three products of a linear layer y[N,O] = x[N,I] . W[O,I]^T, W as stored (no transposed copy) */
+static int dfwd(gpu_arg y, gpu_arg x, gpu_arg w, int N, int O, int I) { return dgemm(y, x, w, N, O, I, I, 1, 1, I, 0); }
+static int ddx(gpu_arg dx, gpu_arg dy, gpu_arg w, int N, int O, int I, int add) { return dgemm(dx, dy, w, N, I, O, O, 1, I, 1, add); }
+static int ddw(gpu_arg dw, gpu_arg dy, gpu_arg x, int N, int O, int I) { return dgemm(dw, dy, x, O, I, N, 1, O, I, 1, 1); }
+static int drms_back(tr_model *m, gpu_arg dx, gpu_arg dw, gpu_arg dy, gpu_arg x, gpu_arg r, gpu_arg w, int N) {
+	tr_dev *d = m->dev;
+	int D = m->c.dim, nb = (N + 127) / 128;
+	LA(GK_RMS_DX, (size_t)N * 64, 1, dx, dy, x, r, w, GI(D));
+	LA(GK_RMS_DW, D, nb, GP(d->part, 0), dy, x, r, GI(D), GI(N));
+	LA(GK_COLSUM, D, 1, dw, GP(d->part, 0), GI(D), GI(nb));
+	return 0;
+}
+
+/* tr_run's dense pass, kernel for kernel; -1 on a device error */
+static double dev_run(tr_model *m, tr_dev *d, const int *in, const int *tgt, int B, int T, float scale) {
+	const tr_config *c = &m->c;
+	int N = B * T, D = c->dim, H = c->heads, KH = c->kv_heads, hd = c->head_dim;
+	int Q = H * hd, KV = KH * hd, F = c->ffn, V = c->vocab, half = hd / 2;
+	size_t rs = (size_t)c->ctx * half;
+	#define A_(ptr) dev_act(m, d, (ptr))
+	#define P_(off) GP(d->p, off)
+	#define G_(off) GP(d->g, off)
+	#define ROPE(x, nh, dir) LA(GK_ROPE, (size_t)N * (nh) * half, 1, x, GP(d->rope, 0), GP(d->rope, rs), GI(N), GI(T), GI(nh), GI(hd), GF(dir))
+	/* the attention products' batch strides (bgemm): S = Q K^T and dP = dO V^T read a head of q
+	   (or dO) and its kv head, writing a head's T x T; O = P V and dQ = dS K read a T x T and a kv
+	   head into a head of ao (dq); dK and dV read a T x T and a head of q (dO) into a kv head */
+	int grp = H / KH;
+	int64_t TT = (int64_t)T * T;
+	const int64_t bq[3][3] = { { (int64_t)T * Q, hd, 1 }, { (int64_t)T * KV, hd, grp }, { H * TT, TT, 1 } };
+	const int64_t bo[3][3] = { { H * TT, TT, 1 }, { (int64_t)T * KV, hd, grp }, { (int64_t)T * Q, hd, 1 } };
+	const int64_t bk[3][3] = { { H * TT, TT, 1 }, { (int64_t)T * Q, hd, 1 }, { (int64_t)T * KV, hd, grp } };
+	float sc = 1.0f / sqrtf((float)hd);
+	/* the ids up: in, tgt, then the embedding's scatter grouped by token (distinct tokens,
+	   where each one's positions start, the positions); the rows' losses come back after */
+	int *hi = d->host, *cnt = d->cnt, nu = 0;
+	memcpy(hi, in, (size_t)N * sizeof(int)); memcpy(hi + N, tgt, (size_t)N * sizeof(int));
+	memset(cnt, 0, (size_t)V * sizeof(int));
+	for (int n = 0; n < N; n++) cnt[in[n]]++;
+	for (int v = 0; v < V; v++) nu += cnt[v] > 0;
+	int *ut = hi + 2 * N, *uo = ut + nu, *up = uo + nu + 1, u = 0, at = 0;
+	for (int v = 0; v < V; v++) if (cnt[v]) { ut[u] = v; uo[u] = at; at += cnt[v]; cnt[v] = uo[u]; u++; }
+	uo[nu] = N;
+	for (int n = 0; n < N; n++) up[cnt[in[n]]++] = n;
+	size_t nll_at = 5 * (size_t)N + 2;
+	if (gpu_put(d->ids, 0, hi, (2 * (size_t)N + 2 * nu + 1 + N) * sizeof(int))) return -1;
+
+	LA(GK_EMBED, (size_t)N * D, 1, A_(m->a[0].x), P_(m->embd), GP(d->ids, 0), GI(D), GI(N));
+	for (int l = 0; l < c->layers; l++) {
+		const tr_layer *L = &m->L[l];
+		tr_acts *a = &m->a[l];
+		LA(GK_ADD_RMS, (size_t)N * 64, 1, A_(a->xn1), A_(a->r1), A_(a->x), A_(l ? m->a[l - 1].xm : a->x), P_(L->attn_norm), GI(D), GF(c->rms_eps), GI(l > 0));
+		if (dfwd(A_(a->q), A_(a->xn1), P_(L->wq), N, Q, D) || dfwd(A_(a->k), A_(a->xn1), P_(L->wk), N, KV, D) ||
+		    dfwd(A_(a->v), A_(a->xn1), P_(L->wv), N, KV, D)) return -1;
+		ROPE(A_(a->q), H, 1); ROPE(A_(a->k), KH, 1);
+		/* S = Q K^T into p, a head a product (its kv head h / grp), the softmax there, then O = P V */
+		if (bgemm(A_(a->p), A_(a->q), A_(a->k), T, T, hd, Q, 1, 1, KV, T, 0, B * H, H, 1, 0, bq) ||
+		    gpu_launch(GK_ATT_SM, (size_t)B * H * T * 64, 1, 1, 3, (gpu_arg[]){ A_(a->p), GI(T), GF(sc) }) ||
+		    bgemm(A_(a->ao), A_(a->p), A_(a->v), T, hd, T, T, 1, KV, 1, Q, 0, B * H, H, 1, 0, bo)) return -1;
+		if (dfwd(A_(a->xm), A_(a->ao), P_(L->wo), N, D, Q)) return -1;
+		LA(GK_ADD_RMS, (size_t)N * 64, 1, A_(a->xn2), A_(a->r2), A_(a->xm), A_(a->x), P_(L->ffn_norm), GI(D), GF(c->rms_eps), GI(1));
+		if (dfwd(A_(a->g), A_(a->xn2), P_(L->gate), N, F, D) || dfwd(A_(a->u), A_(a->xn2), P_(L->up), N, F, D)) return -1;
+		LA(GK_SWIGLU_F, (size_t)N * F, 1, A_(a->g), A_(a->u), A_(a->h), GL((int64_t)N * F));
+		if (dfwd(A_(l + 1 < c->layers ? m->a[l + 1].x : m->xL), A_(a->h), P_(L->down), N, D, F)) return -1;
+	}
+	LA(GK_ADD_RMS, (size_t)N * 64, 1, A_(m->xf), A_(m->rf), A_(m->xL), A_(m->a[c->layers - 1].xm), P_(m->out_norm), GI(D), GF(c->rms_eps), GI(1));
+	if (dfwd(A_(m->lg), A_(m->xf), P_(m->embd), N, V, D)) return -1;
+	LA(GK_CE, (size_t)N * 64, 1, A_(m->lg), GP(d->ids, N), GP(d->ids, nll_at), GI(V), GF(scale));
+	/* the backward queues behind the losses' read, which waits for the forward only */
+	if (gpu_get(d->ids, nll_at * sizeof(int), d->nll, (size_t)N * sizeof(float))) return -1;
+	double nll = 0;
+	for (int n = 0; n < N; n++) nll += d->nll[n];
+
+	if (ddw(G_(m->embd), A_(m->lg), A_(m->xf), N, V, D) || ddx(A_(m->dxn), A_(m->lg), P_(m->embd), N, V, D, 0) ||
+	    gpu_zero(d->act[d->nact - 1], (size_t)(m->dx - m->act - d->base[d->nact - 1]) * sizeof(float), (size_t)N * D * sizeof(float)) ||
+	    drms_back(m, A_(m->dx), G_(m->out_norm), A_(m->dxn), A_(m->xL), A_(m->rf), P_(m->out_norm), N)) return -1;
+	for (int l = c->layers - 1; l >= 0; l--) {
+		const tr_layer *L = &m->L[l];
+		tr_acts *a = &m->a[l];
+		if (ddw(G_(L->down), A_(m->dx), A_(a->h), N, D, F) || ddx(A_(m->dA), A_(m->dx), P_(L->down), N, D, F, 0)) return -1;
+		LA(GK_SWIGLU_B, (size_t)N * F, 1, A_(a->g), A_(a->u), A_(m->dA), A_(m->dB), GL((int64_t)N * F));
+		if (ddw(G_(L->gate), A_(m->dA), A_(a->xn2), N, F, D) || ddw(G_(L->up), A_(m->dB), A_(a->xn2), N, F, D) ||
+		    ddx(A_(m->dxn), A_(m->dA), P_(L->gate), N, F, D, 0) || ddx(A_(m->dxn), A_(m->dB), P_(L->up), N, F, D, 1) ||
+		    drms_back(m, A_(m->dx), G_(L->ffn_norm), A_(m->dxn), A_(a->xm), A_(a->r2), P_(L->ffn_norm), N) ||
+		    ddw(G_(L->wo), A_(m->dx), A_(a->ao), N, D, Q) || ddx(A_(m->dao), A_(m->dx), P_(L->wo), N, D, Q, 0)) return -1;
+		/* dP = dO V^T into ds, dS there, dQ = dS K; dK = sum over the group's heads of dS^T Q and
+		   dV of P^T dO, a launch a head of the group (two heads of one group in a launch would race) */
+		if (bgemm(GP(d->ds, 0), A_(m->dao), A_(a->v), T, T, hd, Q, 1, 1, KV, T, 0, B * H, H, 1, 0, bq) ||
+		    gpu_launch(GK_ATT_SMB, (size_t)B * H * T * 64, 1, 1, 4, (gpu_arg[]){ A_(a->p), GP(d->ds, 0), GI(T), GF(sc) }) ||
+		    bgemm(A_(m->dq), GP(d->ds, 0), A_(a->k), T, hd, T, T, 1, KV, 1, Q, 0, B * H, H, 1, 0, bo)) return -1;
+		for (int g = 0; g < H / KH; g++)
+			if (bgemm(A_(m->dk), GP(d->ds, 0), A_(a->q), T, hd, T, 1, T, Q, 1, KV, g > 0, B * KH, KH, H / KH, g, bk) ||
+			    bgemm(A_(m->dv), A_(a->p), A_(m->dao), T, hd, T, 1, T, Q, 1, KV, g > 0, B * KH, KH, H / KH, g, bk)) return -1;
+		ROPE(A_(m->dq), H, -1); ROPE(A_(m->dk), KH, -1);
+		if (ddw(G_(L->wq), A_(m->dq), A_(a->xn1), N, Q, D) || ddw(G_(L->wk), A_(m->dk), A_(a->xn1), N, KV, D) ||
+		    ddw(G_(L->wv), A_(m->dv), A_(a->xn1), N, KV, D) || ddx(A_(m->dxn), A_(m->dq), P_(L->wq), N, Q, D, 0) ||
+		    ddx(A_(m->dxn), A_(m->dk), P_(L->wk), N, KV, D, 1) || ddx(A_(m->dxn), A_(m->dv), P_(L->wv), N, KV, D, 1) ||
+		    drms_back(m, A_(m->dx), G_(L->attn_norm), A_(m->dxn), A_(a->x), A_(a->r1), P_(L->attn_norm), N)) return -1;
+	}
+	LA(GK_EMB_GRAD, (size_t)nu * D, 1, G_(m->embd), A_(m->dx), GP(d->ids, 2 * (size_t)N), GI(nu), GI(D));
+	#undef A_
+	#undef P_
+	#undef G_
+	#undef ROPE
+	return nll;
+}
+
+static double dev_clip(tr_model *m, double max_norm) {
+	tr_dev *d = m->dev;
+	enum { GR = 256 };
+	float part[GR];
+	gpu_arg a[] = { GP(d->g, 0), GP(d->part, 0), GL((int64_t)m->n) };
+	if (gpu_launch(GK_SUMSQ, GR * 64, 1, 1, 3, a) || gpu_get(d->part, 0, part, sizeof part)) return -1;
+	double ss = 0;
+	for (int i = 0; i < GR; i++) ss += part[i];
+	double norm = sqrt(ss);
+	if (max_norm > 0 && norm > max_norm) {
+		gpu_arg k[] = { GP(d->g, 0), GL((int64_t)m->n), GF((float)(max_norm / norm)) };
+		if (gpu_launch(GK_SCALE, m->n, 1, 1, 3, k)) return -1;
+	}
+	return norm;
+}
+
+static int dev_adamw(tr_model *m, size_t a, size_t n, float lr, float decay, float b1, float b2, float eps, float c1, float c2) {
+	tr_dev *d = m->dev;
+	LA(GK_ADAMW, n, 1, GP(d->p, a), GP(d->g, a), GP(d->mo, a), GP(d->ve, a), GL((int64_t)n),
+	   GF(lr), GF(decay), GF(b1), GF(b2), GF(eps), GF(c1), GF(c2));
+	return 0;
+}
+#undef LA
+#else
+static void to_host(tr_model *m) { (void)m; }
+static void dev_free(tr_model *m) { (void)m; }
+#endif
+
 /* ── forward + backward ───────────────────────────────────────────────────── */
 
 double tr_run(tr_model *m, const int *in, const int *tgt, int B, int T, float scale) {
 	const tr_config *c = &m->c;
 	if (T > c->ctx || B < 1 || T < 1 || ensure_acts(m, B, T)) return -1;
+	m->aux = 0;
+#ifdef HAKM_GPU
+	if (gpu_on && scale > 0 && !c->experts && gpu_name()) {
+		tr_dev *d = dev_ready(m);
+		if (d) { double r = dev_run(m, d, in, tgt, B, T, scale); m->where = 1; return r; }
+	}
+#endif
+	to_host(m);
+	if (scale > 0) host_dirty(m);
 	refresh_pt(m);
+	gpu_now = gpu_on && scale > 0;
 	int N = B * T, D = c->dim, H = c->heads, KH = c->kv_heads, hd = c->head_dim;
 	int Q = H * hd, KV = KH * hd, F = c->ffn, V = c->vocab;
+	int E = c->experts, sh = !E || c->shared, R = N * (int)ffn_rows(c);
+	size_t sN = (size_t)sh * N, FD = (size_t)F * D;   /* the experts' rows start after the shared ffn's */
 	const float *P = m->p, *PT = m->pt;
 
 	for (int n = 0; n < N; n++) memcpy(m->a[0].x + (size_t)n * D, P + m->embd + (size_t)in[n] * D, D * sizeof(float));
@@ -673,11 +1128,28 @@ double tr_run(tr_model *m, const int *in, const int *tgt, int B, int T, float sc
 		run_rows(att_fwd, m, l, B, T, B * H, 0, NULL, NULL);
 		mm_fwd(a->xm, a->ao, PT + L->wo, N, D, Q);
 		add_rms(m, a->xn2, a->r2, a->xm, a->x, P + L->ffn_norm, N);
-		mm_fwd(a->g, a->xn2, PT + L->gate, N, F, D);
-		mm_fwd(a->u, a->xn2, PT + L->up, N, F, D);
-		run_rows(swiglu_fwd, m, l, B, T, N, 0, NULL, NULL);
+		if (E) moe_route(m, l, N, T);
+		if (sh) {
+			mm_fwd(a->g, a->xn2, PT + L->gate, N, F, D);
+			mm_fwd(a->u, a->xn2, PT + L->up, N, F, D);
+		}
+		/* each expert on its rows; gemm divides by zero on none, so skip those */
+		for (int e = 0; e < E; e++) {
+			size_t r0 = a->eoff[e], hr = sN + r0, w = L->experts + 3 * FD * e;
+			int nr = a->eoff[e + 1] - a->eoff[e];
+			if (!nr) continue;
+			mm_fwd(a->g + hr * F, a->xg + r0 * D, PT + w, nr, F, D);
+			mm_fwd(a->u + hr * F, a->xg + r0 * D, PT + w + FD, nr, F, D);
+		}
+		run_rows(swiglu_fwd, m, l, B, T, R, 0, NULL, NULL);
 		float *next = l + 1 < c->layers ? m->a[l + 1].x : m->xL;
-		mm_fwd(next, a->h, PT + L->down, N, D, F);
+		if (sh) mm_fwd(next, a->h, PT + L->down, N, D, F);
+		for (int e = 0; e < E; e++) {
+			size_t r0 = a->eoff[e], hr = sN + r0, w = L->experts + 3 * FD * e;
+			int nr = a->eoff[e + 1] - a->eoff[e];
+			if (nr) mm_fwd(a->o + r0 * D, a->h + hr * F, PT + w + 2 * FD, nr, D, F);
+		}
+		if (E) moe_par(m, 5, l, N, T, next, NULL, 0);
 	}
 	add_rms(m, m->xf, m->rf, m->xL, m->a[c->layers - 1].xm, P + m->out_norm, N);
 	mm_fwd(m->lg, m->xf, PT + m->embd, N, V, D);
@@ -694,14 +1166,41 @@ double tr_run(tr_model *m, const int *in, const int *tgt, int B, int T, float sc
 	for (int l = c->layers - 1; l >= 0; l--) {
 		const tr_layer *L = &m->L[l];
 		tr_acts *a = &m->a[l];
-		/* ffn: x_next = xm + down(silu(gate) * up) */
-		mm_dw(G + L->down, m->dx, a->h, N, D, F);
-		mm_dx(m->dA, m->dx, P + L->down, N, D, F, 0);
-		run_rows(swiglu_bwd, m, l, B, T, N, 0, NULL, NULL);
-		mm_dw(G + L->gate, m->dA, a->xn2, N, F, D);
-		mm_dw(G + L->up, m->dB, a->xn2, N, F, D);
-		mm_dx(m->dxn, m->dA, P + L->gate, N, F, D, 0);
-		mm_dx(m->dxn, m->dB, P + L->up, N, F, D, 1);
+		/* ffn: x_next = xm + down(silu(gate) * up), moe: + sum of gate * expert */
+		if (sh) {
+			mm_dw(G + L->down, m->dx, a->h, N, D, F);
+			mm_dx(m->dA, m->dx, P + L->down, N, D, F, 0);
+		}
+		if (E) moe_par(m, 6, l, N, T, NULL, m->dx, scale);   /* dxg = d(expert outputs), dz */
+		for (int e = 0; e < E; e++) {
+			size_t r0 = a->eoff[e], hr = sN + r0, w = L->experts + 3 * FD * e;
+			int nr = a->eoff[e + 1] - a->eoff[e];
+			if (!nr) continue;
+			mm_dw(G + w + 2 * FD, m->dxg + r0 * D, a->h + hr * F, nr, D, F);
+			mm_dx(m->dA + hr * F, m->dxg + r0 * D, P + w + 2 * FD, nr, D, F, 0);
+		}
+		run_rows(swiglu_bwd, m, l, B, T, R, 0, NULL, NULL);
+		if (sh) {
+			mm_dw(G + L->gate, m->dA, a->xn2, N, F, D);
+			mm_dw(G + L->up, m->dB, a->xn2, N, F, D);
+			mm_dx(m->dxn, m->dA, P + L->gate, N, F, D, 0);
+			mm_dx(m->dxn, m->dB, P + L->up, N, F, D, 1);
+		}
+		/* dxg is free again (the downs read it): now d(gathered inputs) */
+		for (int e = 0; e < E; e++) {
+			size_t r0 = a->eoff[e], hr = sN + r0, w = L->experts + 3 * FD * e;
+			int nr = a->eoff[e + 1] - a->eoff[e];
+			if (!nr) continue;
+			mm_dw(G + w, m->dA + hr * F, a->xg + r0 * D, nr, F, D);
+			mm_dw(G + w + FD, m->dB + hr * F, a->xg + r0 * D, nr, F, D);
+			mm_dx(m->dxg + r0 * D, m->dA + hr * F, P + w, nr, F, D, 0);
+			mm_dx(m->dxg + r0 * D, m->dB + hr * F, P + w + FD, nr, F, D, 1);
+		}
+		if (E) {
+			mm_dw(G + L->router, m->dz, a->xn2, N, E, D);
+			mm_dx(m->dxn, m->dz, P + L->router, N, E, D, sh);
+			moe_par(m, 7, l, N, T, NULL, NULL, 0);
+		}
 		rms_back(m, m->dx, G + L->ffn_norm, m->dxn, a->xm, a->r2, P + L->ffn_norm, N);
 		/* attention: xm = x + wo(attn(rope(wq x), rope(wk x), wv x)) */
 		mm_dw(G + L->wo, m->dx, a->ao, N, D, Q);
@@ -727,9 +1226,23 @@ double tr_run(tr_model *m, const int *in, const int *tgt, int B, int T, float sc
 	return nll;
 }
 
-void tr_zero_grad(tr_model *m) { memset(m->g, 0, m->n * sizeof(float)); }
+/* the grads, clip and step run where the newest copy is */
+#ifdef HAKM_GPU
+#define ON_DEV(m) ((m)->dev && (m)->where != 0)
+#else
+#define ON_DEV(m) 0
+#endif
+void tr_zero_grad(tr_model *m) {
+#ifdef HAKM_GPU
+	if (ON_DEV(m)) { tr_dev *d = m->dev; if (!gpu_zero(d->g, 0, m->n * sizeof(float))) { m->where = 1; return; } to_host(m); host_dirty(m); }
+#endif
+	memset(m->g, 0, m->n * sizeof(float));
+}
 
 double tr_clip(tr_model *m, double max_norm) {
+#ifdef HAKM_GPU
+	if (ON_DEV(m)) { m->where = 1; return dev_clip(m, max_norm); }
+#endif
 	double ss = 0;
 	for (size_t i = 0; i < m->n; i++) ss += (double)m->g[i] * m->g[i];
 	double norm = sqrt(ss);
@@ -741,19 +1254,50 @@ double tr_clip(tr_model *m, double max_norm) {
 }
 
 /* decoupled weight decay on the matrices (the embedding is one), none on norms */
+int tr_set_live(tr_model *m, const size_t *ranges, int n) {
+	size_t *l = NULL;
+	if (ranges && n > 0) {
+		if (!(l = malloc((size_t)n * 2 * sizeof *l))) return -1;
+		memcpy(l, ranges, (size_t)n * 2 * sizeof *l);
+		for (int k = 0; k < n; k++) if (l[2 * k] > m->n || l[2 * k + 1] > m->n - l[2 * k]) { free(l); return -1; }
+	}
+	free(m->live);
+	m->live = l; m->nlive = l ? n : 0;
+	return 0;
+}
+
+static void adamw_span(float *p, const float *g, float *mo, float *ve, size_t n, float lr, float decay, float b1, float b2, float eps, float c1, float c2) {
+	for (size_t j = 0; j < n; j++) {
+		mo[j] = b1 * mo[j] + (1 - b1) * g[j];
+		ve[j] = b2 * ve[j] + (1 - b2) * g[j] * g[j];
+		float mh = mo[j] / c1, vh = ve[j] / c2;
+		p[j] -= lr * (mh / (sqrtf(vh) + eps) + decay * p[j]);
+	}
+}
+
+static void adamw_on(tr_model *m, int dev, size_t a, size_t n, float lr, float decay, float b1, float b2, float eps, float c1, float c2) {
+#ifdef HAKM_GPU
+	if (dev) { dev_adamw(m, a, n, lr, decay, b1, b2, eps, c1, c2); return; }
+#endif
+	(void)dev;
+	adamw_span(m->p + a, m->g + a, m->mo + a, m->ve + a, n, lr, decay, b1, b2, eps, c1, c2);
+}
+
 void tr_adamw(tr_model *m, float lr, float wd, float b1, float b2, float eps) {
 	m->step++;
 	float c1 = 1.0f - powf(b1, (float)m->step), c2 = 1.0f - powf(b2, (float)m->step);
+	int dev = ON_DEV(m);
+	if (dev) m->where = 1;
 	for (int i = 0; i < m->nt; i++) {
 		const tr_tensor *t = &m->t[i];
 		float decay = t->rows > 1 ? wd : 0.0f;
-		size_t n = (size_t)t->rows * t->cols;
-		float *p = m->p + t->off, *g = m->g + t->off, *mo = m->mo + t->off, *ve = m->ve + t->off;
-		for (size_t j = 0; j < n; j++) {
-			mo[j] = b1 * mo[j] + (1 - b1) * g[j];
-			ve[j] = b2 * ve[j] + (1 - b2) * g[j] * g[j];
-			float mh = mo[j] / c1, vh = ve[j] / c2;
-			p[j] -= lr * (mh / (sqrtf(vh) + eps) + decay * p[j]);
+		size_t a = t->off, b = a + (size_t)t->rows * t->cols;
+		if (!m->live) { adamw_on(m, dev, a, b - a, lr, decay, b1, b2, eps, c1, c2); continue; }
+		for (int k = 0; k < m->nlive; k++) {   /* the tensor's part inside each live range */
+			size_t lo = m->live[2 * k], hi = lo + m->live[2 * k + 1];
+			if (lo < a) lo = a;
+			if (hi > b) hi = b;
+			if (lo < hi) adamw_on(m, dev, lo, hi - lo, lr, decay, b1, b2, eps, c1, c2);
 		}
 	}
 	m->pt_ok = 0;
@@ -783,6 +1327,7 @@ size_t tok_blob_len(const void *blob, size_t avail) {
 }
 
 int tr_save(const tr_model *m, const char *path, const void *tok, size_t tok_len, int eos) {
+	to_host((tr_model *)m);   /* the newest weights, from the GPU when they are there */
 	const tr_config *c = &m->c;
 	size_t tok_off = sizeof(mlf2_header) + sizeof(mlf2_tensor) * m->nt;
 	size_t data_off = (tok_off + tok_len + MLF2_ALIGN - 1) / MLF2_ALIGN * MLF2_ALIGN;
@@ -792,7 +1337,8 @@ int tr_save(const tr_model *m, const char *path, const void *tok, size_t tok_len
 	h.n_layers = c->layers; h.d_model = c->dim; h.n_heads = c->heads; h.n_kv_heads = c->kv_heads;
 	h.head_dim = c->head_dim; h.ffn_dim = c->ffn; h.ctx = c->ctx; h.vocab = c->vocab;
 	h.rope_theta = c->rope_theta; h.rms_eps = c->rms_eps;
-	h.flags = MLF2_FLAG_TIED_EMBED; h.n_tensors = m->nt;
+	h.flags = MLF2_FLAG_TIED_EMBED | (c->experts ? MLF2_FLAG_MOE : 0); h.n_tensors = m->nt;
+	h.n_experts = c->experts; h.n_experts_used = c->top_k;
 	h.tensors_off = sizeof(mlf2_header); h.tokenizer_off = tok_off; h.data_off = data_off;
 	h.bos_id = eos; h.eos_id = eos;
 
@@ -833,14 +1379,23 @@ tr_model *tr_load(const char *path, void **tok, size_t *tok_len, int *eos) {
 	const mlf2_header *h = &f.h;
 	tr_config c = { (int)h->vocab, (int)h->d_model, (int)h->n_layers, (int)h->n_heads,
 	                (int)h->n_kv_heads, (int)h->head_dim, (int)h->ffn_dim, (int)h->ctx,
-	                h->rope_theta, h->rms_eps };
+	                h->rope_theta, h->rms_eps, (int)h->n_experts, (int)h->n_experts_used, 0 };
+	/* moe: the flag with its counts, and the shared ffn by its presence */
+	int moe = h->flags == (MLF2_FLAG_TIED_EMBED | MLF2_FLAG_MOE);
+	c.shared = moe && mlf2_find(&f, "blk.0.ffn_gate.weight") != NULL;
 	tr_model *m = NULL;
-	if (h->arch != MLF2_ARCH_HAKO || h->flags != MLF2_FLAG_TIED_EMBED || tr_check(&c)) {
-		fprintf(stderr, "train: %s is not a model this trainer wrote (arch %s, flags %#x)\n",
-		        path, mlf2_arch_name(h->arch), h->flags);
+	if (h->arch != MLF2_ARCH_HAKO || (h->flags != MLF2_FLAG_TIED_EMBED && !moe) || moe != (h->n_experts != 0) ||
+	    (!moe && h->n_experts_used) || tr_check(&c)) {
+		fprintf(stderr, "train: %s is not a model this trainer wrote (arch %s, flags %#x, %u experts)\n",
+		        path, mlf2_arch_name(h->arch), h->flags, h->n_experts);
 		goto out;
 	}
 	if (!(m = tr_alloc(&c))) goto out;
+	/* a stray shared ffn in a later layer would run in the engine and not here */
+	if (moe && h->n_tensors != (uint32_t)m->nt) {
+		fprintf(stderr, "train: %s has %u tensors, a model of its shape %d\n", path, h->n_tensors, m->nt);
+		tr_free(m); m = NULL; goto out;
+	}
 	for (int i = 0; i < m->nt; i++) {
 		const tr_tensor *t = &m->t[i];
 		const mlf2_tensor *e = mlf2_find(&f, t->name);
@@ -864,15 +1419,23 @@ out:
 	return m;
 }
 
-typedef struct { char magic[4]; uint32_t version; uint64_t n, rng; int64_t step; tr_config c; } opt_header;
+/* the header holds tr_config as it first was, ten fields: growing it would orphan
+   every .opt already written (a chain's genesis.opt, its trainers'). dense stays
+   version 1 byte for byte; moe is version 2, its experts, top_k, shared, 0 after */
+typedef struct { int vocab, dim, layers, heads, kv_heads, head_dim, ffn, ctx; float rope_theta, rms_eps; } shape_v1;
+typedef struct { char magic[4]; uint32_t version; uint64_t n, rng; int64_t step; shape_v1 c; } opt_header;
+_Static_assert(sizeof(opt_header) == 72 && offsetof(tr_config, experts) == sizeof(shape_v1), "the v1 .opt header");
 
 int tr_save_opt(const tr_model *m, const char *path, uint64_t rng) {
+	to_host((tr_model *)m);
 	char tmp[4096];
 	snprintf(tmp, sizeof tmp, "%s.part", path);
 	FILE *f = fopen(tmp, "wb");
 	if (!f) { perror(tmp); return -1; }
-	opt_header h = { { 'H', 'K', 'O', 'P' }, 1, m->n, rng, m->step, m->c };
-	int ok = fwrite(&h, sizeof h, 1, f) == 1 &&
+	opt_header h = { { 'H', 'K', 'O', 'P' }, m->c.experts ? 2 : 1, m->n, rng, m->step, { 0 } };
+	memcpy(&h.c, &m->c, sizeof h.c);
+	int32_t ex[4] = { m->c.experts, m->c.top_k, m->c.shared, 0 };
+	int ok = fwrite(&h, sizeof h, 1, f) == 1 && (h.version == 1 || fwrite(ex, sizeof ex, 1, f) == 1) &&
 	         fwrite(m->mo, sizeof(float), m->n, f) == m->n && fwrite(m->ve, sizeof(float), m->n, f) == m->n;
 	if (fclose(f) != 0) ok = 0;
 	if (!ok || rename(tmp, path) != 0) { fprintf(stderr, "train: could not write %s\n", path); remove(tmp); return -1; }
@@ -880,11 +1443,15 @@ int tr_save_opt(const tr_model *m, const char *path, uint64_t rng) {
 }
 
 int tr_load_opt(tr_model *m, const char *path, uint64_t *rng) {
+	to_host(m);   /* p and g too: the host copy is the newest after this */
+	host_dirty(m);
 	FILE *f = fopen(path, "rb");
 	if (!f) { perror(path); return -1; }
 	opt_header h;
-	int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "HKOP", 4) && h.version == 1 &&
+	int32_t ex[4] = { 0 }, want[4] = { m->c.experts, m->c.top_k, m->c.shared, 0 };
+	int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "HKOP", 4) && h.version == (m->c.experts ? 2u : 1u) &&
 	         h.n == m->n && !memcmp(&h.c, &m->c, sizeof h.c);
+	ok = ok && (h.version == 1 || (fread(ex, sizeof ex, 1, f) == 1 && !memcmp(ex, want, sizeof ex)));
 	ok = ok && fread(m->mo, sizeof(float), m->n, f) == m->n && fread(m->ve, sizeof(float), m->n, f) == m->n;
 	fclose(f);
 	if (!ok) { fprintf(stderr, "train: %s does not belong to this model\n", path); return -1; }
@@ -1176,4 +1743,53 @@ done:
 	if (tstr) for (int i = 0; i < vocab; i++) free(tstr[i]);
 	free(tstr); free(tlen); free(merge);
 	return ret;
+}
+
+char *tr_slurp(const char *path, size_t *len) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { perror(path); return NULL; }
+	/* ftello: a corpus past 2 GB, where long is 32 bits */
+	off_t n = fseeko(f, 0, SEEK_END) == 0 ? ftello(f) : -1;
+	if (n < 0 || (uint64_t)n >= SIZE_MAX || fseeko(f, 0, SEEK_SET) != 0) n = -1;
+	char *b = n >= 0 ? malloc((size_t)n + 1) : NULL;
+	if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "train: cannot read %s\n", path); free(b); fclose(f); return NULL; }
+	fclose(f);
+	for (off_t i = 0; i < n; i++) if (!b[i]) b[i] = ' ';   /* the encoder stops at a NUL */
+	b[n] = 0;
+	*len = (size_t)n;
+	return b;
+}
+
+/* text -> ids with the engine's own encoder, the one hakm will use. Encoded in pieces cut
+ * after a blank line, so a corpus past 2 GB fits the encoder's int lengths */
+#define ENC_PIECE ((size_t)64 << 20)
+int *tr_encode(const void *blob, size_t blen, int eos, char *text, size_t len, int64_t *n) {
+	hakm_model fm = {0};
+	fm.tok = blob; fm.map = (void *)blob; fm.map_size = blen; fm.h.eos_id = (uint32_t)eos;
+	hakm_tok *tk = tok_new(&fm);
+	size_t cap = len / 2 + 1024, got = 0;
+	int *ids = tk ? malloc(cap * sizeof(int)) : NULL, ok = ids != NULL;
+	for (size_t at = 0; ok && at < len;) {
+		size_t end = len - at > ENC_PIECE ? at + ENC_PIECE : len;
+		while (end < len && !(text[end - 1] == '\n' && text[end] == '\n')) end++;
+		while (end < len && text[end] == '\n') end++;
+		if (cap - got < end - at + 1) {
+			size_t nc = cap * 2 > got + (end - at) + 1 ? cap * 2 : got + (end - at) + 1;
+			int *nb = realloc(ids, nc * sizeof(int));
+			if (!nb) { ok = 0; break; }
+			ids = nb; cap = nc;
+		}
+		char keep = text[end];
+		text[end] = 0;
+		int k = tok_encode(tk, text + at, ids + got, (int)(end - at) + 1);
+		text[end] = keep;
+		if (k < 0) ok = 0;
+		else got += (size_t)k;
+		at = end;
+	}
+	tok_free(tk);
+	if (!ok) { fprintf(stderr, "train: could not encode the text\n"); free(ids); return NULL; }
+	int *fit = realloc(ids, (got + 1) * sizeof(int));
+	*n = (int64_t)got;
+	return fit ? fit : ids;
 }

@@ -305,6 +305,7 @@ int main(int argc, char **argv) {
 	        mlf2_arch_name(c->model.h.arch), params >= 1e9 ? params / 1e9 : params / 1e6,
 	        params >= 1e9 ? "B" : "M", c->n_layers, c->d_model, c->n_heads, c->n_kv_heads,
 	        c->ffn_dim, c->vocab, max_seq, (double)c->rope_theta);
+	if (c->n_experts) fprintf(stderr, "hakm: experts %d per layer · %d per token\n", c->n_experts, c->n_used);
 	if (info) { hakm_ctx_free(c); return 0; }
 
 	hakm_tok *tk = tok_new(&c->model);

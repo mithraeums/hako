@@ -16,6 +16,7 @@
 #include "../src/loader.h"
 #include "../src/nn.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -34,55 +35,6 @@ static double wall(void) {
 static volatile sig_atomic_t stop = 0;
 static void on_int(int s) { (void)s; stop = 1; signal(SIGINT, SIG_DFL); }
 
-static char *slurp(const char *path, size_t *len) {
-	FILE *f = fopen(path, "rb");
-	if (!f) { perror(path); return NULL; }
-	fseek(f, 0, SEEK_END);
-	long n = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	char *b = n >= 0 ? malloc((size_t)n + 1) : NULL;
-	if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "train: cannot read %s\n", path); free(b); fclose(f); return NULL; }
-	fclose(f);
-	for (long i = 0; i < n; i++) if (!b[i]) b[i] = ' ';   /* the encoder stops at a NUL */
-	b[n] = 0;
-	*len = (size_t)n;
-	return b;
-}
-
-/* text -> ids with the engine's own encoder, the one hakm will use. Encoded in pieces cut
- * after a blank line, so a corpus past 2 GB fits the encoder's int lengths */
-#define ENC_PIECE ((size_t)64 << 20)
-static int *encode(const void *blob, size_t blen, int eos, char *text, size_t len, long *n) {
-	hakm_model fm = {0};
-	fm.tok = blob; fm.map = (void *)blob; fm.map_size = blen; fm.h.eos_id = (uint32_t)eos;
-	hakm_tok *tk = tok_new(&fm);
-	size_t cap = len / 2 + 1024, got = 0;
-	int *ids = tk ? malloc(cap * sizeof(int)) : NULL, ok = ids != NULL;
-	for (size_t at = 0; ok && at < len;) {
-		size_t end = len - at > ENC_PIECE ? at + ENC_PIECE : len;
-		while (end < len && !(text[end - 1] == '\n' && text[end] == '\n')) end++;
-		while (end < len && text[end] == '\n') end++;
-		if (cap - got < end - at + 1) {
-			size_t nc = cap * 2 > got + (end - at) + 1 ? cap * 2 : got + (end - at) + 1;
-			int *nb = realloc(ids, nc * sizeof(int));
-			if (!nb) { ok = 0; break; }
-			ids = nb; cap = nc;
-		}
-		char keep = text[end];
-		text[end] = 0;
-		int k = tok_encode(tk, text + at, ids + got, (int)(end - at) + 1);
-		text[end] = keep;
-		if (k < 0) ok = 0;
-		else got += (size_t)k;
-		at = end;
-	}
-	tok_free(tk);
-	if (!ok) { fprintf(stderr, "train: could not encode the text\n"); free(ids); return NULL; }
-	int *fit = realloc(ids, (got + 1) * sizeof(int));
-	*n = (long)got;
-	return fit ? fit : ids;
-}
-
 /* sleep until the next HH:MM local time; -1 when it does not parse */
 static int wait_until(const char *hm) {
 	int h, mi;
@@ -98,6 +50,31 @@ static int wait_until(const char *hm) {
 	return 0;
 }
 
+/* what a step's routing costs, from the last run's picks: experts a token runs
+   that the token before it (same sequence) did not, per token and layer (each
+   one is a fetch when experts stream from disk), and the busiest expert's load
+   over the mean */
+static void route_stats(const tr_model *m, int B, int T, double *fresh, double *load) {
+	const tr_config *c = tr_cfg(m);
+	int E = c->experts, K = c->top_k;
+	double f = 0, ld = 0;
+	for (int l = 0; l < c->layers; l++) {
+		const int *s = tr_routes(m, l);
+		int cnt[1024] = { 0 }, mx = 0;
+		for (int n = 0; s && n < B * T; n++)
+			for (int i = 0; i < K; i++) {
+				int e = s[n * K + i], seen = 0;
+				cnt[e]++;
+				for (int j = 0; n % T && j < K; j++) seen |= s[(n - 1) * K + j] == e;
+				f += n % T && !seen;
+			}
+		for (int e = 0; e < E; e++) if (cnt[e] > mx) mx = cnt[e];
+		ld += (double)mx * E / ((double)B * T * K);
+	}
+	*fresh = T > 1 ? f / ((double)B * (T - 1) * c->layers) : 0;
+	*load = ld / c->layers;
+}
+
 static void usage(void) {
 	fprintf(stderr,
 		"usage: hakm-train --data TEXT --out MODEL.mlf2 [options]\n"
@@ -106,6 +83,9 @@ static void usage(void) {
 		"  --resume          continue MODEL.mlf2 from MODEL.mlf2.opt (shape and tokenizer from the file)\n"
 		"shape:  --vocab N (4096)  --dim N (256)  --layers N (4)  --heads N (4)  --kv-heads N (= heads)\n"
 		"        --ffn N (3 x dim)  --ctx N (256)  --theta F (10000)\n"
+		"moe:    --experts N (0, dense)  --top-k N (2)  --shared 0|1 (1, the dense ffn beside the experts)\n"
+		"        --sticky F (0)  --balance F (0.01)  aux loss weights: sticky keeps a token on the experts\n"
+		"        the one before it ran, balance spreads the load (sticky alone collapses onto one set)\n"
 		"run:    --steps N (2000)  --batch N (16)  --accum N (1)  --lr F (1e-3)  --min-lr F (lr / 10)\n"
 		"        --warmup N (100)  --wd F (0.1)  --clip F (1)  --seed N (1)\n"
 		"        --eval-every N (200)  --eval-tokens N (65536)  --save-every N (500)  --log-every N (10)\n"
@@ -115,11 +95,11 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
 	const char *data = NULL, *val = NULL, *out = NULL, *tokf = NULL;
-	tr_config c = { 4096, 256, 4, 4, 0, 0, 0, 256, 10000.0f, 1e-5f };
-	long steps = 2000, warmup = 100, eval_every = 200, eval_tokens = 65536, save_every = 500, log_every = 10;
+	tr_config c = { 4096, 256, 4, 4, 0, 0, 0, 256, 10000.0f, 1e-5f, 0, 2, 1 };
+	int64_t steps = 2000, warmup = 100, eval_every = 200, eval_tokens = 65536, save_every = 500, log_every = 10;
 	int batch = 16, accum = 1, resume = 0, niceness = 19;
 	const char *at_time = NULL;
-	float lr = 1e-3f, min_lr = -1, wd = 0.1f, clip = 1.0f;
+	float lr = 1e-3f, min_lr = -1, wd = 0.1f, clip = 1.0f, sticky = 0, balance = 0.01f;
 	uint64_t seed = 1;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -137,19 +117,24 @@ int main(int argc, char **argv) {
 		else if (OPT("--ffn")) c.ffn = atoi(v);
 		else if (OPT("--ctx")) c.ctx = atoi(v);
 		else if (OPT("--theta")) c.rope_theta = (float)atof(v);
-		else if (OPT("--steps")) steps = atol(v);
+		else if (OPT("--experts")) c.experts = atoi(v);
+		else if (OPT("--top-k")) c.top_k = atoi(v);
+		else if (OPT("--shared")) c.shared = atoi(v);
+		else if (OPT("--sticky")) sticky = (float)atof(v);
+		else if (OPT("--balance")) balance = (float)atof(v);
+		else if (OPT("--steps")) steps = atoll(v);
 		else if (OPT("--batch")) batch = atoi(v);
 		else if (OPT("--accum")) accum = atoi(v);
 		else if (OPT("--lr")) lr = (float)atof(v);
 		else if (OPT("--min-lr")) min_lr = (float)atof(v);
-		else if (OPT("--warmup")) warmup = atol(v);
+		else if (OPT("--warmup")) warmup = atoll(v);
 		else if (OPT("--wd")) wd = (float)atof(v);
 		else if (OPT("--clip")) clip = (float)atof(v);
 		else if (OPT("--seed")) seed = strtoull(v, NULL, 10);
-		else if (OPT("--eval-every")) eval_every = atol(v);
-		else if (OPT("--eval-tokens")) eval_tokens = atol(v);
-		else if (OPT("--save-every")) save_every = atol(v);
-		else if (OPT("--log-every")) log_every = atol(v);
+		else if (OPT("--eval-every")) eval_every = atoll(v);
+		else if (OPT("--eval-tokens")) eval_tokens = atoll(v);
+		else if (OPT("--save-every")) save_every = atoll(v);
+		else if (OPT("--log-every")) log_every = atoll(v);
 		else if (OPT("--threads")) setenv("HAKM_THREADS", v, 1);
 		else if (OPT("--nice")) niceness = atoi(v);
 		else if (OPT("--at")) at_time = v;
@@ -166,9 +151,9 @@ int main(int argc, char **argv) {
 	signal(SIGINT, on_int);
 
 	size_t tlen, vlen = 0;
-	char *text = slurp(data, &tlen), *vtext = NULL;
+	char *text = tr_slurp(data, &tlen), *vtext = NULL;
 	if (!text) return 1;
-	if (val && !(vtext = slurp(val, &vlen))) return 1;
+	if (val && !(vtext = tr_slurp(val, &vlen))) return 1;
 
 	char optp[4096];
 	snprintf(optp, sizeof optp, "%s.opt", out);
@@ -178,7 +163,7 @@ int main(int argc, char **argv) {
 	if (resume) {
 		if (!(m = tr_load(out, &blob, &blen, &eos)) || tr_load_opt(m, optp, &rng)) return 1;
 		c = *tr_cfg(m);
-		fprintf(stderr, "resuming %s at step %ld\n", out, *tr_step(m));
+		fprintf(stderr, "resuming %s at step %" PRId64 "\n", out, *tr_step(m));
 	} else {
 		if (!c.kv_heads) c.kv_heads = c.heads;
 		if (c.heads > 0) c.head_dim = c.dim / c.heads;
@@ -204,12 +189,13 @@ int main(int argc, char **argv) {
 		if (bad) { fprintf(stderr, "train: %s\n", bad); return 2; }
 		if (!(m = tr_new(&c, seed))) { fprintf(stderr, "train: out of memory for the model\n"); return 1; }
 	}
+	tr_set_aux(m, sticky, balance);
 
 	double t0 = wall();
-	long ntr, nval = 0;
-	int *ids = encode(blob, blen, eos, text, tlen, &ntr), *vids = NULL, own_vids = vtext != NULL;
+	int64_t ntr, nval = 0;
+	int *ids = tr_encode(blob, blen, eos, text, tlen, &ntr), *vids = NULL, own_vids = vtext != NULL;
 	if (!ids) return 1;
-	if (vtext) { if (!(vids = encode(blob, blen, eos, vtext, vlen, &nval))) return 1; }
+	if (vtext) { if (!(vids = tr_encode(blob, blen, eos, vtext, vlen, &nval))) return 1; }
 	else { nval = ntr / 50; ntr -= nval; vids = ids + ntr; }
 	size_t vbytes = vtext ? vlen : 0;
 	if (!vtext) { /* bytes of the held-out tail, for bits per byte */
@@ -217,18 +203,24 @@ int main(int argc, char **argv) {
 		fm.tok = blob; fm.map = blob; fm.map_size = blen; fm.h.eos_id = (uint32_t)eos;
 		hakm_tok *tk = tok_new(&fm);
 		char buf[256];
-		for (long i = 0; tk && i < nval; i++) vbytes += (size_t)tok_decode_id(tk, vids[i], buf, sizeof buf);
+		for (int64_t i = 0; tk && i < nval; i++) vbytes += (size_t)tok_decode_id(tk, vids[i], buf, sizeof buf);
 		tok_free(tk);
 	}
 	free(text); free(vtext);
 	int T = c.ctx;
 	if (ntr < T + 2 || nval < T + 2) { fprintf(stderr, "train: not enough text for ctx %d\n", T); return 1; }
-	fprintf(stderr, "data: %ld train tokens, %ld val tokens (%.2f bytes per token), encoded in %.1fs\n",
+	fprintf(stderr, "data: %" PRId64 " train tokens, %" PRId64 " val tokens (%.2f bytes per token), encoded in %.1fs\n",
 	        ntr, nval, (double)vbytes / nval, wall() - t0);
 	size_t np = tr_n_params(m), emb = (size_t)c.vocab * c.dim;
 	fprintf(stderr, "model: %.2fM params (%.2fM without the embedding), dim %d, %d layers, %d/%d heads, ffn %d, ctx %d\n",
 	        np / 1e6, (np - emb) / 1e6, c.dim, c.layers, c.heads, c.kv_heads, c.ffn, c.ctx);
-	fprintf(stderr, "run: %ld steps of %d x %d x %d tokens, lr %.1e -> %.1e, %d threads, nice %d\n",
+	if (c.experts) {
+		size_t ex = (size_t)3 * c.ffn * c.dim * c.layers;
+		fprintf(stderr, "experts: %d per layer, top %d%s, %.2fM params run per token, aux sticky %g balance %g\n",
+		        c.experts, c.top_k, c.shared ? " + the shared ffn" : "",
+		        (np - ex * c.experts + ex * c.top_k) / 1e6, sticky, balance);
+	}
+	fprintf(stderr, "run: %" PRId64 " steps of %d x %d x %d tokens, lr %.1e -> %.1e, %d threads, nice %d\n",
 	        steps, batch, accum, T, lr, min_lr, hakm_nthreads(), niceness);
 	fprintf(stderr, "memory: about %.0f MB (%.0f MB of it the token ids)\n",
 	        (tr_mem_bytes(&c, batch, T) + (size_t)(ntr + (own_vids ? nval : 0)) * sizeof(int)) / 1e6,
@@ -236,11 +228,11 @@ int main(int argc, char **argv) {
 
 	int *in = malloc((size_t)batch * T * sizeof(int)), *tg = malloc((size_t)batch * T * sizeof(int));
 	if (!in || !tg) return 1;
-	double tick = wall(), lsum = 0;
-	long lcount = 0, toks = 0;
+	double tick = wall(), lsum = 0, fsum = 0, ldsum = 0, asum = 0;
+	int64_t lcount = 0, toks = 0;
 	int rc = 0;
-	for (long *step = tr_step(m); *step < steps && !stop;) {
-		long s = *step;
+	for (int64_t *step = tr_step(m); *step < steps && !stop;) {
+		int64_t s = *step;
 		float rate = s < warmup ? lr * (s + 1) / warmup
 		           : min_lr + 0.5f * (lr - min_lr) * (1 + cosf(3.14159265f * (s - warmup) / (float)(steps - warmup > 0 ? steps - warmup : 1)));
 		tr_zero_grad(m);
@@ -249,7 +241,7 @@ int main(int argc, char **argv) {
 			for (int b = 0; b < batch; b++) {
 				uint64_t z = (rng += 0x9E3779B97F4A7C15ULL);
 				z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL; z ^= z >> 31;
-				long at = (long)(z % (uint64_t)(ntr - T - 1));
+				int64_t at = (int64_t)(z % (uint64_t)(ntr - T - 1));
 				memcpy(in + (size_t)b * T, ids + at, T * sizeof(int));
 				memcpy(tg + (size_t)b * T, ids + at + 1, T * sizeof(int));
 			}
@@ -257,42 +249,50 @@ int main(int argc, char **argv) {
 			if (l < 0) { fprintf(stderr, "train: out of memory for the activations\n"); return 1; }
 			loss += l;
 		}
+		if (c.experts) {
+			double fr, ld;
+			route_stats(m, batch, T, &fr, &ld);
+			fsum += fr; ldsum += ld; asum += tr_aux(m) / ((double)batch * T);
+		}
 		loss /= (double)batch * T * accum;
-		if (!isfinite(loss)) { fprintf(stderr, "train: loss is %f at step %ld, stopping without saving\n", loss, s); rc = 1; break; }
+		if (!isfinite(loss)) { fprintf(stderr, "train: loss is %f at step %" PRId64 ", stopping without saving\n", loss, s); rc = 1; break; }
 		double gn = tr_clip(m, clip);
 		tr_adamw(m, rate, wd, 0.9f, 0.95f, 1e-8f);
-		lsum += loss; lcount++; toks += (long)batch * T * accum;
+		lsum += loss; lcount++; toks += (int64_t)batch * T * accum;
 		s = *step;
 		int last = s == steps || stop;
 		if (s % log_every == 0 || last) {
 			double now = wall(), tps = toks / (now - tick);
-			fprintf(stderr, "step %5ld/%ld  loss %.4f  lr %.2e  grad %.2f  %.0f tok/s  eta %.0fm\n",
+			fprintf(stderr, "step %5" PRId64 "/%" PRId64 "  loss %.4f  lr %.2e  grad %.2f  %.0f tok/s  eta %.0fm\n",
 			        s, steps, lsum / lcount, rate, gn, tps, (steps - s) * (double)batch * T * accum / tps / 60);
-			tick = now; lsum = 0; lcount = 0; toks = 0;
+			if (c.experts)
+				fprintf(stderr, "  experts: %.2f fresh/token/layer  load max/mean %.2f  aux %.4f/token\n",
+				        fsum / lcount, ldsum / lcount, asum / lcount);
+			tick = now; lsum = 0; lcount = 0; toks = 0; fsum = ldsum = asum = 0;
 		}
 		if ((eval_every > 0 && s % eval_every == 0) || last) {
 			double e0 = wall(), nll = 0;
-			long nt = 0;
-			for (long at = 0; at + T + 1 <= nval && nt < eval_tokens;) {
+			int64_t nt = 0;
+			for (int64_t at = 0; at + T + 1 <= nval && nt < eval_tokens;) {
 				int b = 0;
 				for (; b < batch && at + T + 1 <= nval; b++, at += T) {
 					memcpy(in + (size_t)b * T, vids + at, T * sizeof(int));
 					memcpy(tg + (size_t)b * T, vids + at + 1, T * sizeof(int));
 				}
 				nll += tr_run(m, in, tg, b, T, 0);
-				nt += (long)b * T;
+				nt += (int64_t)b * T;
 			}
 			double vl = nll / nt;
-			fprintf(stderr, "  val loss %.4f  ppl %.2f  %.3f bits/byte  (%ld tokens, %.1fs)\n",
+			fprintf(stderr, "  val loss %.4f  ppl %.2f  %.3f bits/byte  (%" PRId64 " tokens, %.1fs)\n",
 			        vl, exp(vl), vl / log(2.0) * nval / (double)vbytes, nt, wall() - e0);
 			tick += wall() - e0;
 		}
 		if ((save_every > 0 && s % save_every == 0) || last) {
 			if (tr_save(m, out, blob, blen, eos) || tr_save_opt(m, optp, rng)) { rc = 1; break; }
-			fprintf(stderr, "  saved %s at step %ld\n", out, s);
+			fprintf(stderr, "  saved %s at step %" PRId64 "\n", out, s);
 		}
 	}
-	if (stop) fprintf(stderr, "stopped; --resume continues from step %ld\n", *tr_step(m));
+	if (stop) fprintf(stderr, "stopped; --resume continues from step %" PRId64 "\n", *tr_step(m));
 	free(in); free(tg); free(ids);
 	if (own_vids) free(vids);
 	free(blob);

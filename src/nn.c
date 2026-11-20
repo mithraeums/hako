@@ -3,6 +3,9 @@
 #include "nn.h"
 #include "quant.h"
 #include "../include/mlf2.h"
+#ifdef HAKM_GPU
+#include "gpu.h"
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -28,6 +31,22 @@ void softmax(float *x, int n) {
 }
 
 float silu_f(float x) { return x / (1.0f + expf(-x)); }
+
+/* k passes of argmax over the unpicked: k is at most 8, so this beats a sort.
+   strict > keeps the lower index on a tie */
+void topk_gates(const float *z, int E, int k, int *sel, float *gate) {
+	for (int s = 0; s < k; s++) {
+		int b = -1;
+		for (int e = 0; e < E; e++) {
+			int used = 0;
+			for (int t = 0; t < s; t++) used |= sel[t] == e;
+			if (!used && (b < 0 || z[e] > z[b])) b = e;
+		}
+		sel[s] = b;
+		gate[s] = z[b];
+	}
+	softmax(gate, k);
+}
 
 /* NeoX rope: rotate (vec[i], vec[i + hd/2]) pairs. Matches llama.cpp qwen2. */
 void rope_neox(float *vec, int head_dim, int pos, float theta) {
@@ -206,6 +225,9 @@ void hakm_parallel(void (*fn)(void *), void *jobs, size_t jsize, int njobs_total
 void matmul_batch(float *out, const float *x,
                   const hakm_model *m, const mlf2_tensor *w,
                   const float *bias, int n_out, int n_in, int B) {
+#ifdef HAKM_GPU
+	if (gpu_matmul(out, x, m, w, bias, n_out, n_in, B) == 0) return;
+#endif
 	int T = hakm_nthreads();
 	if (n_out < T) T = 1;
 	size_t rb = quant_row_bytes((int)w->type, n_in);

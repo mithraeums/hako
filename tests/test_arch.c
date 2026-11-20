@@ -2,8 +2,11 @@
 /* test_arch.c — the forward pass against a plain reference, on a tiny random
    model shaped like Qwen3: attention width n_heads*head_dim != d_model, and
    per-head q/k norm. The engine sized q and the attention output by d_model,
-   so this shape overflowed both buffers; under ASan the old code fails here. */
+   so this shape overflowed both buffers; under ASan the old code fails here.
+   then routed experts: a reference that ranks and mixes the experts itself,
+   against decode, batch and score, with and without the shared expert. */
 #include "../src/model.h"
+#include "../src/nn.h"
 #include <math.h>
 #if defined(HAKM_KV_F16) && defined(__F16C__) && defined(__FMA__)
 #include <immintrin.h>
@@ -19,12 +22,19 @@ enum { D = 32, H = 4, KVH = 2, HD = 16, QD = H * HD, KVD = KVH * HD, F = 48, V =
 static const float EPS = 1e-6f, THETA = 10000.0f;
 
 typedef struct { char name[48]; int n_in, n_out; float *w; } wt;
-static wt W[64];
+static wt W[128];
 static int nw = 0;
 static unsigned rng = 12345;
 static float frand(void) { rng = rng * 1103515245u + 12345u; return ((rng >> 8) & 0xFFFF) / 65536.0f - 0.5f; }
 
+/* the moe shape build() makes: experts per layer (0 = dense), top-k, whether
+   the dense ffn is there as the shared expert, a tensor to leave out, and
+   whether one expert's gate gets the wrong height */
+static int m_experts = 0, m_used = 0, m_shared = 1, m_bad = 0;
+static const char *m_drop = NULL;
+
 static float *add(const char *name, int n_in, int n_out, int ones) {
+	if (m_drop && !strcmp(name, m_drop)) return NULL;
 	wt *t = &W[nw++];
 	snprintf(t->name, sizeof t->name, "%s", name);
 	t->n_in = n_in; t->n_out = n_out;
@@ -51,18 +61,25 @@ static void build(int qk_norm, int only_q_norm) {
 		if (qk_norm || only_q_norm) { A("attn_q_norm.weight", HD, 1, 1); }
 		if (qk_norm) { A("attn_k_norm.weight", HD, 1, 1); }
 		A("ffn_norm.weight", D, 1, 1);
-		A("ffn_gate.weight", D, F, 0); A("ffn_up.weight", D, F, 0); A("ffn_down.weight", F, D, 0);
+		if (m_shared) { A("ffn_gate.weight", D, F, 0); A("ffn_up.weight", D, F, 0); A("ffn_down.weight", F, D, 0); }
+		if (m_experts) { A("ffn_gate_inp.weight", D, m_experts, 0); }
 		#undef A
+		for (int e = 0; e < m_experts; e++) {
+			snprintf(nm, sizeof nm, "blk.%d.ffn_gate.%d.weight", l, e); add(nm, D, m_bad && l == 1 && e == 2 ? F / 2 : F, 0);
+			snprintf(nm, sizeof nm, "blk.%d.ffn_up.%d.weight", l, e);   add(nm, D, F, 0);
+			snprintf(nm, sizeof nm, "blk.%d.ffn_down.%d.weight", l, e); add(nm, F, D, 0);
+		}
 	}
 }
 
-static void write_model_f(const char *path, uint32_t arch, uint32_t flags) {
+static void write_model_x(const char *path, uint32_t arch, uint32_t flags, uint32_t ne, uint32_t nu) {
 	mlf2_header h; memset(&h, 0, sizeof h);
 	memcpy(h.magic, MLF2_MAGIC, 4);
 	h.version = MLF2_VERSION; h.arch = arch;
 	h.n_layers = NL; h.d_model = D; h.n_heads = H; h.n_kv_heads = KVH; h.head_dim = HD;
 	h.ffn_dim = F; h.ctx = 128; h.vocab = V; h.rope_theta = THETA; h.rms_eps = EPS;
 	h.flags = MLF2_FLAG_TIED_EMBED | flags; h.n_tensors = nw;
+	h.n_experts = ne; h.n_experts_used = nu;
 	h.tensors_off = sizeof h;
 	h.tokenizer_off = h.tensors_off + (uint64_t)nw * sizeof(mlf2_tensor);
 	h.data_off = (h.tokenizer_off + 8 + 31) / 32 * 32;
@@ -90,6 +107,7 @@ static void write_model_f(const char *path, uint32_t arch, uint32_t flags) {
 	fclose(f);
 }
 
+static void write_model_f(const char *path, uint32_t arch, uint32_t flags) { write_model_x(path, arch, flags, 0, 0); }
 static void write_model(const char *path, uint32_t arch) { write_model_f(path, arch, 0); }
 
 /* ── reference: the textbook forward pass, whole sequence at once ── */
@@ -133,6 +151,39 @@ static void r_kv(float *v, int n) {
 	(void)v; (void)n;
 #endif
 }
+/* routed experts the long way: score every expert, rank them all with a stable
+   insertion sort (a tie keeps the lower index first), softmax the top k in
+   double, add each one's SwiGLU times its gate. records which sets ran and
+   whether any k-th/k+1-th pair was close enough to flip on rounding */
+static int r_sets[256], r_close = 0;
+static void r_moe(float *x, const float *xn, int l) {
+	enum { EM = 8 };
+	char nm[48];
+	float z[EM], g[F], u[F], o[D];
+	int ord[EM];
+	snprintf(nm, sizeof nm, "blk.%d.ffn_gate_inp.weight", l);
+	r_mat(z, xn, get(nm), D, m_experts);
+	for (int e = 0; e < m_experts; e++) {
+		int j = e;
+		while (j > 0 && z[ord[j - 1]] < z[e]) { ord[j] = ord[j - 1]; j--; }
+		ord[j] = e;
+	}
+	double gw[EM], sum = 0;
+	for (int s = 0; s < m_used; s++) { gw[s] = exp((double)z[ord[s]] - z[ord[0]]); sum += gw[s]; }
+	unsigned set = 0;
+	for (int s = 0; s < m_used; s++) {
+		int e = ord[s];
+		set |= 1u << e;
+		snprintf(nm, sizeof nm, "blk.%d.ffn_gate.%d.weight", l, e); r_mat(g, xn, get(nm), D, F);
+		snprintf(nm, sizeof nm, "blk.%d.ffn_up.%d.weight", l, e);   r_mat(u, xn, get(nm), D, F);
+		for (int i = 0; i < F; i++) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+		snprintf(nm, sizeof nm, "blk.%d.ffn_down.%d.weight", l, e); r_mat(o, g, get(nm), F, D);
+		for (int i = 0; i < D; i++) x[i] += (float)(gw[s] / sum) * o[i];
+	}
+	r_sets[set & 255] = 1;
+	if (m_used < m_experts && z[ord[m_used - 1]] - z[ord[m_used]] < 1e-3f) r_close++;
+}
+
 static void reference(const int *toks, int n, float *logits) {
 	static float x[16][D], xn[D], q[16][QD], k[16][KVD], v[16][KVD], att[QD], o[D], g[F], u[F];
 	char nm[48];
@@ -166,11 +217,14 @@ static void reference(const int *toks, int n, float *logits) {
 			r_mat(o, att, G("attn_output.weight"), QD, D);
 			for (int i = 0; i < D; i++) x[t][i] += o[i];
 			r_norm(xn, x[t], G("ffn_norm.weight"), D);
-			r_mat(g, xn, G("ffn_gate.weight"), D, F);
-			r_mat(u, xn, G("ffn_up.weight"), D, F);
-			for (int i = 0; i < F; i++) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
-			r_mat(o, g, G("ffn_down.weight"), F, D);
-			for (int i = 0; i < D; i++) x[t][i] += o[i];
+			if (G("ffn_gate.weight")) {
+				r_mat(g, xn, G("ffn_gate.weight"), D, F);
+				r_mat(u, xn, G("ffn_up.weight"), D, F);
+				for (int i = 0; i < F; i++) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+				r_mat(o, g, G("ffn_down.weight"), F, D);
+				for (int i = 0; i < D; i++) x[t][i] += o[i];
+			}
+			if (m_experts) r_moe(x[t], xn, l);
 		}
 		#undef G
 	}
@@ -181,6 +235,53 @@ static void reference(const int *toks, int n, float *logits) {
 static float maxdiff(const float *a, const float *b, int n) {
 	float m = 0; for (int i = 0; i < n; i++) { float d = fabsf(a[i] - b[i]); if (d > m) m = d; }
 	return m;
+}
+
+/* perplexity scoring: Σ -log p(tok[i+1] | tok[0..i]) from the reference's logits */
+static double ref_nll(const int *toks, int n, int from) {
+	double want = 0;
+	for (int i = from; i < n - 1; i++) {
+		float r[V]; reference(toks, i + 1, r);
+		double mx = r[0], se = 0;
+		for (int v = 1; v < V; v++) if (r[v] > mx) mx = r[v];
+		for (int v = 0; v < V; v++) se += exp(r[v] - mx);
+		want += log(se) + mx - r[toks[i + 1]];
+	}
+	return want;
+}
+
+/* one moe file (4 experts) through decode, batch and score against the
+   reference; leaves the batch logits in got[] */
+static void moe_case(const char *p, const int *toks, int n, int shared, int used, float *got) {
+	char w[160];
+	m_experts = 4; m_used = used; m_shared = shared;
+	build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, used);
+	memset(r_sets, 0, sizeof r_sets); r_close = 0;
+	float ref[V]; reference(toks, n, ref);
+	int sets = 0;
+	for (int i = 0; i < 256; i++) sets += r_sets[i];
+	snprintf(w, sizeof w, "moe shared=%d k=%d: routes vary across tokens (%d sets) and none is a near tie", shared, used, sets);
+	ck(sets >= 3 && !r_close, w);
+	hakm_ctx *c = hakm_ctx_new(p, 64);
+	snprintf(w, sizeof w, "moe shared=%d k=%d: loads, the expert count and the shared ffn picked up", shared, used);
+	ck(c && c->n_experts == 4 && c->n_used == used && !c->layers[1].gate == !shared, w);
+	memset(got, 0, V * sizeof *got);
+	if (!c) return;
+	const float *lg = NULL;
+	for (int i = 0; i < n; i++) lg = hakm_forward(c, toks[i]);
+	snprintf(w, sizeof w, "moe shared=%d k=%d: token-at-a-time decode matches the reference", shared, used);
+	ck(maxdiff(lg, ref, V) < 1e-3f, w);
+	hakm_reset(c);
+	lg = hakm_forward_batch(c, toks, n);
+	snprintf(w, sizeof w, "moe shared=%d k=%d: batched prefill matches the reference", shared, used);
+	ck(lg && maxdiff(lg, ref, V) < 1e-3f, w);
+	if (lg) memcpy(got, lg, V * sizeof *got);
+	hakm_reset(c);
+	double s = hakm_score_batch(c, toks, n, 2), want = ref_nll(toks, n, 2);
+	snprintf(w, sizeof w, "moe shared=%d k=%d: hakm_score_batch matches the reference log-likelihood", shared, used);
+	ck(fabs(s - want) < 1e-3 * (n - 3), w);
+	hakm_ctx_free(c);
 }
 
 int main(void) {
@@ -204,15 +305,7 @@ int main(void) {
 		hakm_reset(c);
 		lg = hakm_forward_batch(c, toks, n);
 		ck(lg && maxdiff(lg, ref, V) < 1e-3f, "batched prefill matches the reference");
-		/* perplexity scoring: Σ -log p(tok[i+1] | tok[0..i]) from the reference's logits */
-		double want = 0;
-		for (int i = 2; i < n - 1; i++) {
-			float r[V]; reference(toks, i + 1, r);
-			double mx = r[0], se = 0;
-			for (int v = 1; v < V; v++) if (r[v] > mx) mx = r[v];
-			for (int v = 0; v < V; v++) se += exp(r[v] - mx);
-			want += log(se) + mx - r[toks[i + 1]];
-		}
+		double want = ref_nll(toks, n, 2);
 		hakm_reset(c);
 		double got = hakm_score_batch(c, toks, n, 2);
 		ck(fabs(got - want) < 1e-3 * (n - 3), "hakm_score_batch (perplexity) matches the reference log-likelihood");
@@ -253,6 +346,55 @@ int main(void) {
 	build(1, 0);
 	write_model(p, MLF2_ARCH_COUNT);
 	ck(hakm_ctx_new(p, 64) == NULL, "an arch this engine does not know is refused, not run as qwen2");
+
+	/* routing: rank order, a tie to the lower index, softmax over just the k */
+	{
+		const float z[4] = { 1, 3, 3, 0 }, flat[4] = { 2, 2, 2, 2 };
+		int sel[3]; float gw[3];
+		topk_gates(z, 4, 3, sel, gw);
+		ck(sel[0] == 1 && sel[1] == 2 && sel[2] == 0, "topk_gates ranks by score, a tie to the lower index");
+		ck(fabsf(gw[0] - gw[1]) < 1e-6f && fabsf(gw[0] + gw[1] + gw[2] - 1) < 1e-6f &&
+		   fabsf(gw[0] / gw[2] - expf(2)) < 1e-4f, "and its gates are a softmax over the picked scores only");
+		topk_gates(flat, 4, 2, sel, gw);
+		ck(sel[0] == 0 && sel[1] == 1 && gw[0] == 0.5f && gw[1] == 0.5f, "all tied: the lowest indices, equal gates");
+	}
+
+	/* routed experts, with the shared expert and without, and k as a real knob */
+	float k2[V], k3[V], k2s0[V];
+	moe_case(p, toks, n, 1, 2, k2);
+	moe_case(p, toks, n, 1, 3, k3);
+	ck(maxdiff(k2, k3, V) > 1e-2f, "n_experts_used is load-bearing: the same weights at k=3 give other logits");
+	moe_case(p, toks, n, 0, 2, k2s0);
+
+	/* each file below is the k=2 one with exactly one thing wrong */
+	m_shared = 1; m_used = 2;
+	build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 0, 0);
+	ck(hakm_ctx_new(p, 64) == NULL, "the moe flag without an expert count is refused");
+	write_model_x(p, MLF2_ARCH_HAKO, 0, 4, 2);
+	ck(hakm_ctx_new(p, 64) == NULL, "an expert count without the moe flag is refused");
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 5);
+	ck(hakm_ctx_new(p, 64) == NULL, "n_experts_used > n_experts is refused");
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 0);
+	ck(hakm_ctx_new(p, 64) == NULL, "n_experts_used = 0 is refused");
+	m_drop = "blk.1.ffn_down.3.weight"; build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 2);
+	ck(hakm_ctx_new(p, 64) == NULL, "a missing expert tensor is refused");
+	m_drop = "blk.0.ffn_gate_inp.weight"; build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 2);
+	ck(hakm_ctx_new(p, 64) == NULL, "a missing router is refused");
+	m_drop = "blk.0.ffn_up.weight"; build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 2);
+	ck(hakm_ctx_new(p, 64) == NULL, "a shared ffn missing one of its three tensors is refused");
+	m_drop = NULL; m_bad = 1; build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 2);
+	ck(hakm_ctx_new(p, 64) == NULL, "an expert of the wrong shape is refused (it would overrun the scratch)");
+	m_bad = 0; build(1, 0);
+	write_model_x(p, MLF2_ARCH_HAKO, MLF2_FLAG_MOE, 4, 2);
+	hakm_ctx *c2 = hakm_ctx_new(p, 64);
+	ck(c2 != NULL, "and the same file put right loads (the refusals were for the fault)");
+	hakm_ctx_free(c2);
+	m_experts = 0; m_used = 0;
 
 	for (int i = 0; i < nw; i++) free(W[i].w);
 	remove(p);

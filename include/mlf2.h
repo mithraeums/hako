@@ -86,9 +86,14 @@ static inline const char *mlf2_type_name(uint32_t t) {
 #define MLF2_FLAG_QKV_BIAS    (1u << 0)  /* attn q/k/v have bias vectors */
 #define MLF2_FLAG_TIED_EMBED  (1u << 1)  /* lm_head == token_embd (no output.weight) */
 #define MLF2_FLAG_ROPE_NORM   (1u << 2)  /* rope pairs (2i, 2i+1); clear = neox (i, i+d/2) */
+/* routed experts: header n_experts / n_experts_used, per layer a router
+ * blk.L.ffn_gate_inp.weight [E x d_model] (f32) and blk.L.ffn_{gate,up,down}.E.weight.
+ * the plain blk.L.ffn_* tensors, when present, are a shared expert every token runs.
+ * a flag (not a version bump) so an older engine refuses the file by the rule below */
+#define MLF2_FLAG_MOE         (1u << 3)
 /* A bit outside this mask is a feature this engine does not implement: the file
  * is refused rather than run without it, which would give wrong logits. */
-#define MLF2_FLAGS_KNOWN      (MLF2_FLAG_QKV_BIAS | MLF2_FLAG_TIED_EMBED | MLF2_FLAG_ROPE_NORM)
+#define MLF2_FLAGS_KNOWN      (MLF2_FLAG_QKV_BIAS | MLF2_FLAG_TIED_EMBED | MLF2_FLAG_ROPE_NORM | MLF2_FLAG_MOE)
 
 typedef struct __attribute__((packed)) {
 	char     magic[4];        /* "MLF2" */
@@ -111,8 +116,15 @@ typedef struct __attribute__((packed)) {
 	uint64_t data_off;        /* offset of tensor data (MLF2_ALIGN-aligned) */
 	uint32_t bos_id;
 	uint32_t eos_id;
-	uint8_t  reserved[36];
-} mlf2_header;                /* sizeof == 128 */
+	uint32_t n_experts;       /* routed experts per layer; 0 = dense (MLF2_FLAG_MOE) */
+	uint32_t n_experts_used;  /* experts each token runs, top-k of the router */
+	uint8_t  reserved[28];
+} mlf2_header;
+#ifdef __cplusplus
+static_assert(sizeof(mlf2_header) == 128, "mlf2_header is 128 bytes on disk");
+#else
+_Static_assert(sizeof(mlf2_header) == 128, "mlf2_header is 128 bytes on disk");
+#endif
 
 /* One entry in the tensor directory. `data_off` is relative to header.data_off. */
 typedef struct __attribute__((packed)) {

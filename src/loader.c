@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later — Copyright (C) 2026 Zachary Blauser */
 /* loader.c — MLF2 mmap + tensor directory. */
 #include "loader.h"
+#ifdef HAKM_GPU
+#include "gpu.h"
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -89,6 +92,9 @@ int mlf2_open(const char *path, hakm_model *m) {
 }
 
 void mlf2_close(hakm_model *m) {
+#ifdef HAKM_GPU
+	if (m->map && m->map != MAP_FAILED) gpu_forget(m->map, m->map_size);
+#endif
 	if (m->map && m->map != MAP_FAILED) munmap(m->map, m->map_size);
 	m->map = NULL;
 }

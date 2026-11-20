@@ -266,6 +266,7 @@ src/sample.c       temp / top-k / top-p / greedy, repetition penalty
 src/kvcache.c      the system-prompt KV prefix on disk, with eviction
 src/models.c       hakm list / pull / rm: the model store
 src/train.c        the trainer: backward pass, AdamW, BPE training, MLF2 out
+src/iloss.c        a trainer model's loss in integers, the same to the bit on every machine
 src/hakm_api.c     optional in-process library (libhakm.a); not the agent's path
 cli/main.c         the hakm CLI: one-shot / raw / REPL / --chat-stdin / --serve
 cli/train.c        hakm-train, the training loop (make train)
